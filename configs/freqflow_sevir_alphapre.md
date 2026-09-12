@@ -52,6 +52,25 @@ that file has only `train` and `test` splits. Thus, with `--valid`, validation
 and the final test report use the same held-out HDF5 group; this launcher keeps
 that source behavior rather than silently inventing a new split.
 
+## Background launchers
+
+`train_manager.sh` and `train_manager_meteonet.sh` provide the same
+`start`, `resume`, `stop`, `status`, and `dir` workflow as the existing
+PercpCast manager scripts. They resolve the FreqFlow project directory from
+their own location rather than embedding a server-specific checkout path.
+
+```bash
+bash train_manager_meteonet.sh start
+bash train_manager_meteonet.sh status
+bash train_manager_meteonet.sh resume
+
+bash train_manager.sh start
+```
+
+The data paths, visible GPU, per-process batch size, epoch count, precision,
+and validation mode are at the top of each dataset launcher. The defaults are
+the current server paths, GPU `0`, batch size `1`, `fp16`, and 100 epochs.
+
 The flow state is the normalized future VIL sequence `[B,20,H,W]`; the history
 is `[B,5,H,W]`.  It uses FlowCast's conditional-flow-matching direction
 (`noise -> future`) while retaining FreqFlow's low/high-frequency velocity
