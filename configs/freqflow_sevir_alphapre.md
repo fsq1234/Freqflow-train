@@ -70,6 +70,9 @@ bash train_manager.sh start
 The data paths, visible GPU, per-process batch size, epoch count, precision,
 and validation mode are at the top of each dataset launcher. The defaults are
 the current server paths, GPU `0`, batch size `1`, `fp16`, and 100 epochs.
+`FREQFLOW_FINAL_TEST_CHECKPOINT=last` keeps the original behavior of testing
+the final EMA; set it to `best` to load `best.pt`'s EMA before the automatic
+full test.
 
 The flow state is the normalized future VIL sequence `[B,20,H,W]`; the history
 is `[B,5,H,W]`.  It uses FlowCast's conditional-flow-matching direction

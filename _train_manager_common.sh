@@ -30,6 +30,7 @@ SEED="${FREQFLOW_SEED:-0}"
 VALIDATE="${FREQFLOW_VALIDATE:-1}"
 VALID_LIMIT="${FREQFLOW_VALID_LIMIT:-0}"
 VLNUM="${FREQFLOW_VLNUM:-10}"
+FINAL_TEST_CHECKPOINT="${FREQFLOW_FINAL_TEST_CHECKPOINT:-last}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -93,6 +94,7 @@ make_launch_command() {
         --sample-steps "${SAMPLE_STEPS}"
         --mixed-precision "${MIXED_PRECISION}"
         --seed "${SEED}"
+        --final-test-checkpoint "${FINAL_TEST_CHECKPOINT}"
     )
     [[ "${VALIDATE}" == "1" ]] && LAUNCH_CMD+=(--valid)
     [[ "${VALID_LIMIT}" == "1" ]] && LAUNCH_CMD+=(--valid-limit --vlnum "${VLNUM}")
@@ -111,6 +113,7 @@ write_run_config() {
         echo "Frames: ${FRAMES_IN} input + ${FRAMES_OUT} future"
         echo "Batch size per process: ${BATCH_SIZE}"
         echo "Mixed precision: ${MIXED_PRECISION}"
+        echo "Automatic full-test checkpoint: ${FINAL_TEST_CHECKPOINT}.pt EMA"
         echo ""
         printf 'Command: '
         printf '%q ' "${LAUNCH_CMD[@]}"

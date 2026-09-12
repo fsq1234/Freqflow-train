@@ -24,6 +24,7 @@ export FREQFLOW_SAMPLE_STEPS=20
 export FREQFLOW_VALIDATE=1
 export FREQFLOW_VALID_LIMIT=0
 export FREQFLOW_VLNUM=10
+export FREQFLOW_FINAL_TEST_CHECKPOINT=last
 export FREQFLOW_SEED=0
 
 exec bash "${SCRIPT_DIR}/_train_manager_common.sh" "$@"

@@ -41,6 +41,10 @@ def parse_args():
     parser.add_argument("--valid", action="store_true", help="run AlphaPre validation and choose best.pt by mean CSI")
     parser.add_argument("--valid-limit", action="store_true")
     parser.add_argument("--vlnum", type=int, default=10)
+    parser.add_argument(
+        "--final-test-checkpoint", choices=("last", "best"), default="last",
+        help="EMA checkpoint evaluated automatically on the full test set after training",
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -290,9 +294,15 @@ def main():
     # AlphaPre's full evaluator is intentionally used only after training; its
     # additional LPIPS/SSIM/CRPS reporting is too expensive for every epoch.
     if args.valid:
+        accelerator.wait_for_everyone()
+        final_checkpoint_path = workdir / "checkpoints" / f"{args.final_test_checkpoint}.pt"
+        if not final_checkpoint_path.is_file():
+            raise FileNotFoundError(f"final test checkpoint not found: {final_checkpoint_path}")
+        final_checkpoint = torch.load(final_checkpoint_path, map_location="cpu")
+        ema_model.load_state_dict(final_checkpoint["ema"])
         results = evaluate(accelerator, ema_model, test_loader, args, metrics.Evaluator, pixel_scale, thresholds)
         if accelerator.is_main_process:
-            print(f"AlphaPre test metrics: {results}")
+            print(f"AlphaPre test metrics ({args.final_test_checkpoint}.pt EMA): {results}")
 
 
 if __name__ == "__main__":
