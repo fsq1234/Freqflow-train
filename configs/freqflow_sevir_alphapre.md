@@ -9,9 +9,12 @@ thresholds `(16, 74, 133, 160, 181, 219)`, CSI checkpoint selection, and full
 test reporting follow AlphaPre's original implementation without requiring an
 external AlphaPre checkout.
 
-The supplied training entrypoint is intentionally fixed to AlphaPre's SEVIR
-`5 -> 20` contract. The CIKM, MeteoNet and Shanghai readers are included for
-later dataset-specific launchers; their input/output frame contract must be set
+The supplied training entrypoint keeps AlphaPre's `5 -> 20` contract and
+supports `--dataset sevir` (default) and `--dataset meteo`.  SEVIR uses its
+original internally batched reader. MeteoNet uses AlphaPre's original ordinary
+PyTorch `DataLoader` path and takes the single `meteo_radar.h5` file as
+`--data-path`. The CIKM and Shanghai readers are included for later
+dataset-specific launchers; their input/output frame contract must be set
 before training them with FreqFlow.
 
 `configs/freqflow_nowcast_alphapre.py` is the active model configuration. It
@@ -32,6 +35,22 @@ Run from `FreqFlow` with its required dependencies installed and a SEVIR root co
 ```powershell
 accelerate launch train_nowcast_alphapre.py --data-path D:\path\to\sevir2 --valid
 ```
+
+For AlphaPre-format MeteoNet data:
+
+```bash
+accelerate launch train_nowcast_alphapre.py \
+  --dataset meteo \
+  --data-path /mnt/sdb1/user/WRF/stlP/data/meteo_radar.h5 \
+  --batch-size 1 \
+  --mixed-precision fp16 \
+  --valid
+```
+
+AlphaPre's original `Meteo` reader maps `val` to the HDF5 `test` group because
+that file has only `train` and `test` splits. Thus, with `--valid`, validation
+and the final test report use the same held-out HDF5 group; this launcher keeps
+that source behavior rather than silently inventing a new split.
 
 The flow state is the normalized future VIL sequence `[B,20,H,W]`; the history
 is `[B,5,H,W]`.  It uses FlowCast's conditional-flow-matching direction

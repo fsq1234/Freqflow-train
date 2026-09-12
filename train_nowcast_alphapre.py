@@ -1,4 +1,4 @@
-"""Conditional FreqFlow training with vendored AlphaPre SEVIR data/metrics."""
+"""Conditional FreqFlow training with vendored AlphaPre radar data/metrics."""
 
 import argparse
 import copy
@@ -18,10 +18,14 @@ from sde import multi_scale_targets
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-path", required=True, help="AlphaPre SEVIR root (CATALOG.csv plus data/)")
+    parser.add_argument("--dataset", choices=("sevir", "meteo"), default="sevir")
+    parser.add_argument(
+        "--data-path", required=True,
+        help="SEVIR root (CATALOG.csv plus data/) or MeteoNet meteo_radar.h5 file",
+    )
     parser.add_argument("--workdir", default="workdir/freqflow_cond_fs_sevir_5to20")
     parser.add_argument("--img-size", type=int, default=128)
-    parser.add_argument("--stride", type=int, default=13)
+    parser.add_argument("--stride", type=int, default=13, help="SEVIR sequence stride; unused for MeteoNet")
     parser.add_argument("--frames-in", type=int, default=5)
     parser.add_argument("--frames-out", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -80,17 +84,36 @@ def make_run_config(args):
     }
 
 
-def build_sevir_loaders(data_path, img_size, stride, batch_size, num_workers):
-    """Use the vendored, unmodified AlphaPre SEVIR reader and sampler."""
-    get_datasets.DATAPATH["sevir"] = data_path
+def build_loaders(dataset_name, data_path, img_size, stride, batch_size, num_workers):
+    """Use AlphaPre's original reader and loader contract for each radar set."""
+    get_datasets.DATAPATH[dataset_name] = data_path
     train, valid, test, _, pixel_scale, thresholds = get_datasets.get_dataset(
-        data_name="sevir", img_size=img_size, seq_len=25,
+        data_name=dataset_name, img_size=img_size, seq_len=25,
         batch_size=batch_size, stride=stride,
     )
+    if dataset_name == "sevir":
+        # SEVIR already batches internally, exactly as AlphaPre does.
+        train_loader = train.get_torch_dataloader(num_workers=num_workers)
+        valid_loader = valid.get_torch_dataloader(num_workers=num_workers)
+        test_loader = test.get_torch_dataloader(num_workers=num_workers)
+    elif dataset_name == "meteo":
+        # This is AlphaPre's non-SEVIR loader behavior (grad accumulation is
+        # one in this entrypoint, so its train batch is batch_size directly).
+        train_loader = torch.utils.data.DataLoader(
+            train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True,
+        )
+        valid_loader = torch.utils.data.DataLoader(
+            valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        )
+    else:
+        raise ValueError(f"unsupported dataset: {dataset_name}")
     return (
-        train.get_torch_dataloader(num_workers=num_workers),
-        valid.get_torch_dataloader(num_workers=num_workers),
-        test.get_torch_dataloader(num_workers=num_workers),
+        train_loader,
+        valid_loader,
+        test_loader,
         pixel_scale,
         thresholds,
     )
@@ -197,7 +220,7 @@ def save_checkpoint(path, accelerator, model, ema_model, optimizer, scheduler, e
 def main():
     args = parse_args()
     if args.frames_in != 5 or args.frames_out != 20:
-        raise ValueError("AlphaPre-compatible SEVIR runs require --frames-in 5 --frames-out 20")
+        raise ValueError("AlphaPre-compatible runs require --frames-in 5 --frames-out 20")
     torch.manual_seed(args.seed)
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     run_config = make_run_config(args)
@@ -205,8 +228,8 @@ def main():
     if accelerator.is_main_process:
         workdir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, valid_loader, test_loader, pixel_scale, thresholds = build_sevir_loaders(
-        args.data_path, args.img_size, args.stride, args.batch_size, args.num_workers
+    train_loader, valid_loader, test_loader, pixel_scale, thresholds = build_loaders(
+        args.dataset, args.data_path, args.img_size, args.stride, args.batch_size, args.num_workers
     )
     model = build_freqflow(args.frames_in, args.frames_out, args.img_size)
     ema_model = copy.deepcopy(model).eval().to(accelerator.device)
