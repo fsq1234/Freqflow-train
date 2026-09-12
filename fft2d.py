@@ -1,33 +1,31 @@
 
-from PIL import Image
-from torchvision import transforms
 from torch import fft
 import torch
 
 def gaussian_filter_high_pass(fshift, D):
     D=D/8.
     b, c, h, w = fshift.shape
-    x = torch.arange(0, h)
-    y = torch.arange(0, w)
+    x = torch.arange(0, h, device=fshift.device, dtype=fshift.real.dtype)
+    y = torch.arange(0, w, device=fshift.device, dtype=fshift.real.dtype)
 
     # Create a mesh grid
     x, y = torch.meshgrid(x, y, indexing='ij')
     #x, y = torch.mgrid[0:h, 0:w]
     center = (int((h - 1) / 2), int((w - 1) / 2))
     dis_square = (x - center[0]) ** 2 + (y - center[1]) ** 2
-    template = 1 - torch.exp(- dis_square / (2 * D ** 2)).cuda()
+    template = 1 - torch.exp(- dis_square / (2 * D ** 2))
     return template.unsqueeze(0).unsqueeze(0).repeat(b,c,1,1) * fshift
 
 def gaussian_filter_low_pass(fshift, D):
     D=D*2
     b, c, h, w = fshift.shape
-    x = torch.arange(0, h)
-    y = torch.arange(0, w)
+    x = torch.arange(0, h, device=fshift.device, dtype=fshift.real.dtype)
+    y = torch.arange(0, w, device=fshift.device, dtype=fshift.real.dtype)
     # Create a mesh grid
     x, y = torch.meshgrid(x, y, indexing='ij')
     center = (int((h - 1) / 2), int((w - 1) / 2))
     dis_square = (x - center[0]) ** 2 + (y - center[1]) ** 2
-    template = torch.exp(- dis_square / (2 * D ** 2)).cuda()
+    template = torch.exp(- dis_square / (2 * D ** 2))
     return template.unsqueeze(0).unsqueeze(0).repeat(b,c,1,1) * fshift
 
 def Fourier_filter(x, D):

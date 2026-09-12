@@ -316,6 +316,30 @@ class FreqFlow(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.channels = config.channels
+        # ``channels`` is the state to be generated.  In the original
+        # ImageNet setup this is a four-channel VAE latent.  The optional
+        # history interface lets the same frequency/spatial network be used
+        # for conditional nowcasting, where channels is the number of future
+        # frames and history_channels is the number of observed frames.
+        self.history_channels = getattr(config, "history_channels", 0)
+        if self.history_channels:
+            # Encode the observed sequence once, then give each FreqFlow stage
+            # its own view of it.  The 3x3 layers provide local motion/rain-band
+            # context; the following 1x1 layers only align channels with the
+            # frequency (2 * future frames) and spatial (future frames) inputs.
+            self.history_feature_dim = getattr(config, "history_feature_dim", 64)
+            self.history_encoder = nn.Sequential(
+                nn.Conv2d(self.history_channels, self.history_feature_dim, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(self.history_feature_dim, self.history_feature_dim, kernel_size=3, padding=1),
+                nn.SiLU(),
+            )
+            self.frequency_condition = nn.Conv2d(
+                self.history_feature_dim, self.channels * 2, kernel_size=1
+            )
+            self.spatial_condition = nn.Conv2d(
+                self.history_feature_dim, self.channels, kernel_size=1
+            )
 
         for stage_config in config.stage_configs:
             if hasattr(config, "condition_dim"):
@@ -338,8 +362,20 @@ class FreqFlow(nn.Module):
             for stage_config, lowres_dim, lowres_height in check_zip(config.stage_configs, lowres_dims, lowres_heights)]
         )
 
-    def _forward(self, images, log_snr, condition_classes = None, condition_text_embeds = None, condition_text_masks = None, condition_drop_prob = None):
+    def _forward(self, images, log_snr, condition_classes = None, condition_text_embeds = None, condition_text_masks = None, condition_drop_prob = None, history = None):
         TimeDependentParameter.seed_time(self, log_snr)
+
+        history_features = None
+        if self.history_channels:
+            if history is None:
+                raise ValueError("history is required when history_channels is configured")
+            if history.ndim != 4 or history.shape[1] != self.history_channels:
+                raise ValueError(
+                    f"expected history [B,{self.history_channels},H,W], got {tuple(history.shape)}"
+                )
+            if history.shape[0] != images.shape[0] or history.shape[-2:] != images.shape[-2:]:
+                raise ValueError("history and flow state must share batch and spatial dimensions")
+            history_features = self.history_encoder(history)
 
         if condition_text_embeds is not None:
             condition_embeds = self.text_conditioning(condition_text_embeds)
@@ -355,18 +391,23 @@ class FreqFlow(nn.Module):
         for idx, stage in enumerate(self.stages):
             if idx==0:
                 low_x, high_x = Fourier_filter(images, D=8)
-                output, lowres_skips = stage(torch.cat([low_x, high_x], dim=1), lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
+                frequency_input = torch.cat([low_x, high_x], dim=1)
+                if self.history_channels:
+                    frequency_input = frequency_input + self.frequency_condition(history_features)
+                output, lowres_skips = stage(frequency_input, lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
                 outputs.append(output)
                 lowres_skips = torch.cat(lowres_skips, dim = -1)
             else:
-                output, lowres_skips = stage(images, lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
+                spatial_input = images
+                if self.history_channels:
+                    spatial_input = spatial_input + self.spatial_condition(history_features)
+                output, lowres_skips = stage(spatial_input, lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
                 outputs.append(output)
                 lowres_skips = torch.cat(lowres_skips, dim = -1)
 
 
         return outputs
 
-    def forward(self, x, t = None, log_snr = None, y = None):
-        
-        return self._forward(images = x, log_snr = log_snr, condition_classes = y)
+    def forward(self, x, t = None, log_snr = None, y = None, history = None):
+        return self._forward(images = x, log_snr = log_snr, condition_classes = y, history = history)
         
