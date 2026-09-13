@@ -4,11 +4,13 @@ import argparse
 import copy
 import math
 import os
+import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from tqdm import tqdm
 import utils
 from alphapre_compat import get_datasets, metrics, metrics_valid
 from configs.freqflow_nowcast_alphapre import get_config as get_nowcast_config
@@ -37,6 +39,11 @@ def parse_args():
     parser.add_argument("--ema-rate", type=float, default=0.95)
     parser.add_argument("--ema-update-every", type=int, default=20)
     parser.add_argument("--sample-steps", type=int, default=20)
+    parser.add_argument("--log-every", type=int, default=20, help="write terminal/W&B training progress every N steps")
+    parser.add_argument("--use-wandb", action="store_true", help="enable Weights & Biases experiment tracking")
+    parser.add_argument("--wandb-project", default="freqflow-nowcast", help="Weights & Biases project name")
+    parser.add_argument("--wandb-name", default=None, help="Weights & Biases run display name")
+    parser.add_argument("--wandb-group", default=None, help="Weights & Biases run group")
     parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="no")
     parser.add_argument("--valid", action="store_true", help="run AlphaPre validation and choose best.pt by mean CSI")
     parser.add_argument("--valid-limit", action="store_true")
@@ -85,6 +92,60 @@ def make_run_config(args):
             "frames_out": config.frames_out,
         },
         "arguments": vars(args).copy(),
+    }
+
+
+def init_wandb(args, workdir, run_config, accelerator):
+    """Mirror PercpCast's resumable, main-process-only WandB bookkeeping."""
+    if not args.use_wandb or not accelerator.is_main_process:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "WandB is enabled but unavailable. Install it in the training environment with "
+            "`python -m pip install wandb`, then run `wandb login`."
+        ) from exc
+
+    run_id_path = workdir / "wandb_run_id.txt"
+    if run_id_path.is_file():
+        run_id = run_id_path.read_text(encoding="utf-8").strip()
+    else:
+        run_id = wandb.util.generate_id()
+        run_id_path.write_text(run_id, encoding="utf-8")
+
+    run = wandb.init(
+        id=run_id,
+        project=args.wandb_project,
+        name=args.wandb_name or workdir.name,
+        group=args.wandb_group or None,
+        config=run_config,
+        dir=str(workdir),
+        resume="allow",
+        allow_val_change=True,
+    )
+    if getattr(run, "url", None):
+        print(f"W&B run: {run.url}", flush=True)
+    return run
+
+
+def reduce_losses(accelerator, losses):
+    """Return per-step loss means across all Accelerate processes."""
+    return {
+        name: accelerator.gather(value.detach().float().reshape(1)).mean().item()
+        for name, value in losses.items()
+    }
+
+
+def mean_epoch_losses(accelerator, loss_sums, loss_count):
+    """Compute global epoch means without assuming a single GPU."""
+    count = torch.tensor([float(loss_count)], device=accelerator.device)
+    global_count = accelerator.gather(count).sum().item()
+    return {
+        name: accelerator.gather(
+            torch.tensor([value], device=accelerator.device, dtype=torch.float32)
+        ).sum().item() / max(global_count, 1.0)
+        for name, value in loss_sums.items()
     }
 
 
@@ -192,10 +253,30 @@ def update_ema(ema_model, model, rate):
 
 
 @torch.no_grad()
-def evaluate(accelerator, model, loader, args, evaluator_cls, pixel_scale, thresholds, limit=None):
+def evaluate(
+    accelerator,
+    model,
+    loader,
+    args,
+    evaluator_cls,
+    pixel_scale,
+    thresholds,
+    limit=None,
+    description="Evaluation",
+):
     evaluator = evaluator_cls(seq_len=args.frames_out, value_scale=pixel_scale, thresholds=thresholds)
     model.eval()
-    for index, batch in enumerate(loader):
+    total = min(len(loader), limit) if limit is not None else len(loader)
+    progress = tqdm(
+        loader,
+        total=total,
+        desc=description,
+        disable=not accelerator.is_main_process,
+        ncols=120,
+        leave=False,
+        mininterval=1.0,
+    )
+    for index, batch in enumerate(progress):
         history, future = split_batch(batch, args.frames_in, args.frames_out, accelerator.device)
         prediction = sample_future(model, history, args.frames_out, args.sample_steps)
         # Restore AlphaPre's original [B, T, 1, H, W] metric interface.  The
@@ -206,6 +287,7 @@ def evaluate(accelerator, model, loader, args, evaluator_cls, pixel_scale, thres
             evaluator.evaluate(gathered_future, gathered_prediction)
         if limit is not None and index + 1 >= limit:
             break
+    progress.close()
     return evaluator.done(is_main_process=True) if accelerator.is_main_process else None
 
 
@@ -221,16 +303,34 @@ def save_checkpoint(path, accelerator, model, ema_model, optimizer, scheduler, e
     }, path)
 
 
+def append_epoch_metrics(workdir, epoch, step, epoch_losses, lr, validation, best_csi, elapsed_seconds):
+    """Keep a small append-only epoch record next to the existing train.log."""
+    validation_csi = "disabled" if validation is None else f"{float(validation['csi']):.8f}"
+    with (workdir / "metrics.txt").open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"epoch={epoch + 1} global_step={step} "
+            f"train_total={epoch_losses['total_loss']:.8f} "
+            f"train_spatial={epoch_losses['spatial_loss']:.8f} "
+            f"train_frequency={epoch_losses['frequency_loss']:.8f} "
+            f"lr={lr:.10g} validation_csi={validation_csi} "
+            f"best_csi={best_csi:.8f} elapsed_seconds={elapsed_seconds:.2f}\n"
+        )
+
+
 def main():
     args = parse_args()
     if args.frames_in != 5 or args.frames_out != 20:
         raise ValueError("AlphaPre-compatible runs require --frames-in 5 --frames-out 20")
+    if args.log_every < 1:
+        raise ValueError("--log-every must be at least 1")
     torch.manual_seed(args.seed)
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     run_config = make_run_config(args)
     workdir = Path(args.workdir)
     if accelerator.is_main_process:
         workdir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    wandb_run = init_wandb(args, workdir, run_config, accelerator)
 
     train_loader, valid_loader, test_loader, pixel_scale, thresholds = build_loaders(
         args.dataset, args.data_path, args.img_size, args.stride, args.batch_size, args.num_workers
@@ -256,9 +356,59 @@ def main():
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch, step, best_csi = checkpoint["epoch"] + 1, checkpoint["step"], checkpoint["best_csi"]
 
+    if accelerator.is_main_process:
+        print("============================================================", flush=True)
+        print("                 FreqFlow Training Start", flush=True)
+        print("============================================================", flush=True)
+        print(f"Device: {accelerator.device}", flush=True)
+        print(f"GPU Count: {torch.cuda.device_count()}", flush=True)
+        print(f"Processes: {accelerator.num_processes}", flush=True)
+        print(f"Train Batch Size (per process): {args.batch_size}", flush=True)
+        print(f"Train Data: {len(train_loader)} batches per process", flush=True)
+        print(f"Val Data: {len(valid_loader)} batches per process", flush=True)
+        print(f"Test Data: {len(test_loader)} batches per process", flush=True)
+        print(f"Total Epochs: {args.epochs}", flush=True)
+        print("Optimizer: AdamW (betas=(0.9, 0.95))", flush=True)
+        print(f"Learning Rate: {args.lr}", flush=True)
+        print(f"Pixel Scale: {pixel_scale}", flush=True)
+        print(f"Thresholds: {thresholds}", flush=True)
+        print("Model: original full-capacity FreqFlow nowcast backbone", flush=True)
+        print(f"Workdir: {workdir}", flush=True)
+        if args.resume:
+            print(f"Resume checkpoint: {args.resume}", flush=True)
+        if args.use_wandb:
+            print(
+                f"W&B: enabled (project={args.wandb_project}, "
+                f"group={args.wandb_group or 'none'})",
+                flush=True,
+            )
+        else:
+            print("W&B: disabled", flush=True)
+        print("============================================================", flush=True)
+
+    global_pbar = tqdm(
+        initial=step,
+        total=args.epochs * len(train_loader),
+        disable=not accelerator.is_main_process,
+        desc="Overall Progress",
+        mininterval=1.0,
+    )
+    lr = scheduler.get_last_lr()[0]
     for epoch in range(start_epoch, args.epochs):
+        epoch_started = time.monotonic()
+        if accelerator.is_main_process:
+            print(f"\n========== Epoch {epoch + 1}/{args.epochs} start ==========", flush=True)
         model.train()
-        for batch in train_loader:
+        epoch_loss_sums = {"total_loss": 0.0, "spatial_loss": 0.0, "frequency_loss": 0.0}
+        epoch_loss_count = 0
+        train_pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            disable=not accelerator.is_main_process,
+            ncols=120,
+            mininterval=1.0,
+        )
+        for batch_index, batch in enumerate(train_pbar, start=1):
             history, future = split_batch(batch, args.frames_in, args.frames_out, accelerator.device)
             with accelerator.autocast():
                 loss, losses = conditional_freqflow_loss(model, history, future)
@@ -270,13 +420,53 @@ def main():
             step += 1
             if step % args.ema_update_every == 0:
                 update_ema(ema_model, accelerator.unwrap_model(model), args.ema_rate)
-            accelerator.log({key: value.item() for key, value in losses.items()} | {"lr": scheduler.get_last_lr()[0]}, step=step)
+            lr = scheduler.get_last_lr()[0]
+            local_losses = {name: value.float().item() for name, value in losses.items()}
+            for name, value in local_losses.items():
+                epoch_loss_sums[name] += value
+            epoch_loss_count += 1
+
+            if accelerator.is_main_process:
+                train_pbar.set_postfix(
+                    loss=f"{local_losses['total_loss']:.4f}",
+                    spatial=f"{local_losses['spatial_loss']:.4f}",
+                    frequency=f"{local_losses['frequency_loss']:.4f}",
+                    lr=f"{lr:.2e}",
+                )
+                global_pbar.update(1)
+
+            should_log = batch_index == 1 or batch_index % args.log_every == 0 or batch_index == len(train_loader)
+            if should_log:
+                logged_losses = reduce_losses(accelerator, losses)
+                if accelerator.is_main_process:
+                    print(
+                        f"Epoch {epoch + 1}/{args.epochs}, Step {batch_index}/{len(train_loader)}, "
+                        f"Global step {step} | total={logged_losses['total_loss']:.6f} "
+                        f"spatial={logged_losses['spatial_loss']:.6f} "
+                        f"frequency={logged_losses['frequency_loss']:.6f} lr={lr:.3e}",
+                        flush=True,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "Train/total_loss": logged_losses["total_loss"],
+                                "Train/spatial_loss": logged_losses["spatial_loss"],
+                                "Train/frequency_loss": logged_losses["frequency_loss"],
+                                "Learning_Rate": lr,
+                                "Epoch": epoch + 1,
+                                "Batch": batch_index,
+                            },
+                            step=step,
+                        )
+        train_pbar.close()
+        epoch_losses = mean_epoch_losses(accelerator, epoch_loss_sums, epoch_loss_count)
 
         validation = None
         if args.valid:
             validation = evaluate(
                 accelerator, ema_model, valid_loader, args, metrics_valid.Evaluator,
                 pixel_scale, thresholds, args.vlnum if args.valid_limit else None,
+                description=f"Epoch {epoch + 1}/{args.epochs} [Val]",
             )
             if accelerator.is_main_process and validation["csi"] > best_csi:
                 best_csi = validation["csi"]
@@ -284,12 +474,41 @@ def main():
                     workdir / "checkpoints" / "best.pt", accelerator, model, ema_model,
                     optimizer, scheduler, epoch, step, best_csi, run_config,
                 )
+                print(f"Save Best Model: validation CSI={best_csi:.8f} at epoch {epoch + 1}", flush=True)
         save_checkpoint(
             workdir / "checkpoints" / "last.pt", accelerator, model, ema_model,
             optimizer, scheduler, epoch, step, best_csi, run_config,
         )
         if accelerator.is_main_process:
-            print(f"epoch={epoch} validation={validation} best_csi={best_csi}")
+            elapsed_seconds = time.monotonic() - epoch_started
+            validation_csi = "disabled" if validation is None else f"{float(validation['csi']):.8f}"
+            print(f"Save Last Model: epoch {epoch + 1}", flush=True)
+            print(f"========== Epoch {epoch + 1}/{args.epochs} summary ==========", flush=True)
+            print(
+                f"Train: time={elapsed_seconds:.1f}s total={epoch_losses['total_loss']:.6f} "
+                f"spatial={epoch_losses['spatial_loss']:.6f} "
+                f"frequency={epoch_losses['frequency_loss']:.6f} lr={lr:.3e}",
+                flush=True,
+            )
+            print(f"Validation CSI: {validation_csi}", flush=True)
+            print(f"Best validation CSI: {best_csi:.8f}", flush=True)
+            append_epoch_metrics(
+                workdir, epoch, step, epoch_losses, lr, validation, best_csi, elapsed_seconds
+            )
+            if wandb_run is not None:
+                epoch_log = {
+                    "Loss/train": epoch_losses["total_loss"],
+                    "Loss/spatial": epoch_losses["spatial_loss"],
+                    "Loss/frequency": epoch_losses["frequency_loss"],
+                    "Learning_Rate": lr,
+                    "Epoch": epoch + 1,
+                    "Time/epoch_seconds": elapsed_seconds,
+                }
+                if validation is not None:
+                    epoch_log["Metrics/Validation_CSI"] = float(validation["csi"])
+                    epoch_log["Metrics/Best_Validation_CSI"] = float(best_csi)
+                wandb_run.log(epoch_log, step=step)
+        accelerator.wait_for_everyone()
 
     # AlphaPre's full evaluator is intentionally used only after training; its
     # additional LPIPS/SSIM/CRPS reporting is too expensive for every epoch.
@@ -300,9 +519,26 @@ def main():
             raise FileNotFoundError(f"final test checkpoint not found: {final_checkpoint_path}")
         final_checkpoint = torch.load(final_checkpoint_path, map_location="cpu")
         ema_model.load_state_dict(final_checkpoint["ema"])
-        results = evaluate(accelerator, ema_model, test_loader, args, metrics.Evaluator, pixel_scale, thresholds)
+        results = evaluate(
+            accelerator,
+            ema_model,
+            test_loader,
+            args,
+            metrics.Evaluator,
+            pixel_scale,
+            thresholds,
+            description=f"Final test ({args.final_test_checkpoint}.pt EMA)",
+        )
         if accelerator.is_main_process:
-            print(f"AlphaPre test metrics ({args.final_test_checkpoint}.pt EMA): {results}")
+            print(f"AlphaPre test metrics ({args.final_test_checkpoint}.pt EMA): {results}", flush=True)
+            if wandb_run is not None:
+                wandb_run.log({"Metrics/Test_CSI": float(results["csi"])}, step=step)
+
+    global_pbar.close()
+    if accelerator.is_main_process:
+        if wandb_run is not None:
+            wandb_run.finish()
+        print("FreqFlow training complete.", flush=True)
 
 
 if __name__ == "__main__":

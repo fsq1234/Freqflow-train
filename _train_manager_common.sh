@@ -25,6 +25,11 @@ WARMUP_STEPS="${FREQFLOW_WARMUP_STEPS:-1000}"
 EMA_RATE="${FREQFLOW_EMA_RATE:-0.95}"
 EMA_UPDATE_EVERY="${FREQFLOW_EMA_UPDATE_EVERY:-20}"
 SAMPLE_STEPS="${FREQFLOW_SAMPLE_STEPS:-20}"
+LOG_EVERY="${FREQFLOW_LOG_EVERY:-20}"
+USE_WANDB="${FREQFLOW_USE_WANDB:-1}"
+WANDB_PROJECT="${FREQFLOW_WANDB_PROJECT:-freqflow-nowcast}"
+WANDB_GROUP="${FREQFLOW_WANDB_GROUP:-${RUN_GROUP}}"
+WANDB_NAME="${FREQFLOW_WANDB_NAME:-}"
 MIXED_PRECISION="${FREQFLOW_MIXED_PRECISION:-fp16}"
 SEED="${FREQFLOW_SEED:-0}"
 VALIDATE="${FREQFLOW_VALIDATE:-1}"
@@ -92,6 +97,7 @@ make_launch_command() {
         --ema-rate "${EMA_RATE}"
         --ema-update-every "${EMA_UPDATE_EVERY}"
         --sample-steps "${SAMPLE_STEPS}"
+        --log-every "${LOG_EVERY}"
         --mixed-precision "${MIXED_PRECISION}"
         --seed "${SEED}"
         --final-test-checkpoint "${FINAL_TEST_CHECKPOINT}"
@@ -101,6 +107,20 @@ make_launch_command() {
     fi
     if [[ "${VALID_LIMIT}" == "1" ]]; then
         LAUNCH_CMD+=(--valid-limit --vlnum "${VLNUM}")
+    fi
+    if [[ "${USE_WANDB}" == "1" ]]; then
+        local wandb_name
+        if [[ -n "${WANDB_NAME}" ]]; then
+            wandb_name="${WANDB_NAME}"
+        else
+            wandb_name="${RUN_GROUP}-$(basename -- "${RUN_DIR}")"
+        fi
+        LAUNCH_CMD+=(
+            --use-wandb
+            --wandb-project "${WANDB_PROJECT}"
+            --wandb-name "${wandb_name}"
+            --wandb-group "${WANDB_GROUP}"
+        )
     fi
     return 0
 }
@@ -118,6 +138,8 @@ write_run_config() {
         echo "Frames: ${FRAMES_IN} input + ${FRAMES_OUT} future"
         echo "Batch size per process: ${BATCH_SIZE}"
         echo "Mixed precision: ${MIXED_PRECISION}"
+        echo "Progress log interval: ${LOG_EVERY} steps"
+        echo "W&B: ${USE_WANDB} (project=${WANDB_PROJECT}, group=${WANDB_GROUP})"
         echo "Automatic full-test checkpoint: ${FINAL_TEST_CHECKPOINT}.pt EMA"
         echo ""
         printf 'Command: '
