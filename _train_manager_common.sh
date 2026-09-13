@@ -96,8 +96,13 @@ make_launch_command() {
         --seed "${SEED}"
         --final-test-checkpoint "${FINAL_TEST_CHECKPOINT}"
     )
-    [[ "${VALIDATE}" == "1" ]] && LAUNCH_CMD+=(--valid)
-    [[ "${VALID_LIMIT}" == "1" ]] && LAUNCH_CMD+=(--valid-limit --vlnum "${VLNUM}")
+    if [[ "${VALIDATE}" == "1" ]]; then
+        LAUNCH_CMD+=(--valid)
+    fi
+    if [[ "${VALID_LIMIT}" == "1" ]]; then
+        LAUNCH_CMD+=(--valid-limit --vlnum "${VLNUM}")
+    fi
+    return 0
 }
 
 write_run_config() {
