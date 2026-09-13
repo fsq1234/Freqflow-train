@@ -10,6 +10,13 @@ export FREQFLOW_DATASET=meteo
 export FREQFLOW_DATA_PATH=/mnt/sdb1/user/WRF/stlP/data/meteo_radar.h5
 export FREQFLOW_RUN_GROUP=meteo-5to20
 export CUDA_VISIBLE_DEVICES=0
+# Prefer the activated Conda C++ runtime over the host's older libstdc++.
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+# Required by Accelerate on this RTX 4000-series server.
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
 export FREQFLOW_NUM_PROCESSES=1
 export FREQFLOW_BATCH_SIZE=1
 export FREQFLOW_NUM_WORKERS=4
