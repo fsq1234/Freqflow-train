@@ -127,7 +127,9 @@ class MeteoFrameDataset(Dataset):
         with h5py.File(self.data_path, "r") as handle:
             frame = handle[self.split][str(event_index)][frame_index]
         frame = torch.from_numpy(frame).float().div_(PIXEL_SCALE)
-        frame = self.transform(frame).unsqueeze(0)
+        # A single radar frame is [H, W].  Unlike AlphaPre's whole event
+        # [T, H, W], it needs an explicit C=1 dimension before Resize.
+        frame = self.transform(frame.unsqueeze(0))
         return frame, event_index, frame_index
 
 
