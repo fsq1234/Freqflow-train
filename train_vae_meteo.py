@@ -101,14 +101,25 @@ class FlowCastVAELoss(nn.Module):
         adaptive = adaptive * self.disc_weight
         disc_factor = 1.0 if use_discriminator else 0.0
         total = nll + self.kl_weight * kl + adaptive * disc_factor * gan
-        return total, {"reconstruction": rec.detach(), "kl": kl.detach(), "gan": gan.detach(), "adaptive": adaptive.detach()}
+        return total, {
+            "reconstruction": rec.detach(),
+            "nll": nll.detach(),
+            "kl": kl.detach(),
+            "gan": gan.detach(),
+            "adaptive": adaptive.detach(),
+            "disc_factor": torch.tensor(disc_factor, device=source.device),
+            "logvar": self.logvar.detach(),
+        }
 
     def discriminator_loss(self, source, reconstruction, use_discriminator):
         real = self.discriminator(source.detach())
         fake = self.discriminator(reconstruction.detach())
         hinge = 0.5 * (F.relu(1.0 - real).mean() + F.relu(1.0 + fake).mean())
         disc_factor = 1.0 if use_discriminator else 0.0
-        return disc_factor * hinge
+        return disc_factor * hinge, {
+            "logits_real": real.detach().mean(),
+            "logits_fake": fake.detach().mean(),
+        }
 
     def forward(self, mode, *args):
         """Route updates through ``forward`` so DDP synchronizes this module."""
@@ -185,12 +196,15 @@ def init_wandb(args, workdir, accelerator):
 
 
 @torch.no_grad()
-def validate(accelerator, model, criterion, loader, thresholds, limit):
+def validate(accelerator, model, criterion, loader, thresholds, limit, use_discriminator):
     evaluator = metrics_valid.Evaluator(seq_len=1, value_scale=PIXEL_SCALE, thresholds=thresholds)
     model.eval()
     criterion.eval()
     total_l1 = total_mse = pixels = 0.0
-    total_generator_loss = generator_loss_batches = 0.0
+    total_generator_loss = total_discriminator_loss = 0.0
+    total_nll = total_kl = total_reconstruction = 0.0
+    total_logits_real = total_logits_fake = 0.0
+    generator_loss_batches = 0.0
     for batch_index, (frames, _, _) in enumerate(loader):
         frames = frames.to(accelerator.device, non_blocking=True)
         reconstruction, posterior = model(frames, sample_posterior=False)
@@ -198,9 +212,22 @@ def validate(accelerator, model, criterion, loader, thresholds, limit):
         # its adaptive GAN term is zero (there is no autograd graph), leaving
         # the source-faithful NLL/reconstruction plus KL objective.
         raw_criterion = accelerator.unwrap_model(criterion)
-        nll, _, kl = raw_criterion.reconstruction_terms(frames, reconstruction, posterior)
+        nll, reconstruction_loss, kl = raw_criterion.reconstruction_terms(
+            frames, reconstruction, posterior
+        )
         generator_loss = nll + raw_criterion.kl_weight * kl
+        discriminator_loss, discriminator_details = raw_criterion.discriminator_loss(
+            frames, reconstruction, use_discriminator
+        )
         gathered_generator_loss = accelerator.gather(generator_loss.detach().float().reshape(1))
+        gathered_discriminator_loss = accelerator.gather(discriminator_loss.detach().float().reshape(1))
+        gathered_nll = accelerator.gather(nll.detach().float().reshape(1))
+        gathered_kl = accelerator.gather(kl.detach().float().reshape(1))
+        gathered_reconstruction_loss = accelerator.gather(
+            reconstruction_loss.detach().float().reshape(1)
+        )
+        gathered_logits_real = accelerator.gather(discriminator_details["logits_real"].float().reshape(1))
+        gathered_logits_fake = accelerator.gather(discriminator_details["logits_fake"].float().reshape(1))
         gathered_source = accelerator.gather_for_metrics(frames)
         gathered_reconstruction = accelerator.gather_for_metrics(reconstruction)
         if accelerator.is_main_process:
@@ -211,15 +238,34 @@ def validate(accelerator, model, criterion, loader, thresholds, limit):
             total_mse += F.mse_loss(reconstruction_cpu, source_cpu, reduction="sum").item()
             pixels += float(source_cpu.numel())
             total_generator_loss += gathered_generator_loss.sum().item()
+            total_discriminator_loss += gathered_discriminator_loss.sum().item()
+            total_nll += gathered_nll.sum().item()
+            total_kl += gathered_kl.sum().item()
+            total_reconstruction += gathered_reconstruction_loss.sum().item()
+            total_logits_real += gathered_logits_real.sum().item()
+            total_logits_fake += gathered_logits_fake.sum().item()
             generator_loss_batches += float(gathered_generator_loss.numel())
         if limit and batch_index + 1 >= limit:
             break
     result = evaluator.done(is_main_process=True) if accelerator.is_main_process else None
     if accelerator.is_main_process:
+        generator_loss = total_generator_loss / max(generator_loss_batches, 1.0)
+        discriminator_loss = total_discriminator_loss / max(generator_loss_batches, 1.0)
         result.update({
-            "generator_loss": total_generator_loss / max(generator_loss_batches, 1.0),
+            "generator_loss": generator_loss,
+            "discriminator_loss": discriminator_loss,
+            "total_loss": 0.5 * (generator_loss + discriminator_loss),
             "l1": total_l1 / max(pixels, 1.0),
             "mse": total_mse / max(pixels, 1.0),
+            "nll": total_nll / max(generator_loss_batches, 1.0),
+            "kl": total_kl / max(generator_loss_batches, 1.0),
+            "reconstruction": total_reconstruction / max(generator_loss_batches, 1.0),
+            "logvar": raw_criterion.logvar.detach().float().item(),
+            "disc_factor": float(use_discriminator),
+            "d_weight": 0.0,
+            "g_loss": -total_logits_fake / max(generator_loss_batches, 1.0),
+            "logits_real": total_logits_real / max(generator_loss_batches, 1.0),
+            "logits_fake": total_logits_fake / max(generator_loss_batches, 1.0),
         })
     model.train()
     criterion.train()
@@ -267,7 +313,9 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     model = RadarAutoencoder(config)
     criterion = FlowCastVAELoss(args.kl_weight, args.disc_weight)
-    generator_optimizer = torch.optim.AdamW(list(model.parameters()) + [criterion.logvar], lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+    # Match FlowCast's actual optimizer construction: logvar is defined by the
+    # loss module but is not included in the generator optimizer.
+    generator_optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     discriminator_optimizer = torch.optim.AdamW(criterion.discriminator.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     updates_per_epoch = math.ceil(len(train_loader) / accelerator.num_processes)
     total_steps = args.epochs * max(updates_per_epoch, 1)
@@ -302,7 +350,12 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         model.train(); criterion.train()
-        sums = {name: 0.0 for name in ("total", "reconstruction", "kl", "gan", "adaptive", "discriminator")}
+        sums = {
+            name: 0.0 for name in (
+                "total", "reconstruction", "nll", "kl", "gan", "adaptive",
+                "disc_factor", "logvar", "discriminator", "logits_real", "logits_fake",
+            )
+        }
         batches = 0
         progress = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch + 1}/{args.epochs}", ncols=120)
         for frames, _, _ in progress:
@@ -317,30 +370,58 @@ def main():
                 reconstruction, posterior = model(frames, sample_posterior=False)
                 generator_loss, details = criterion("generator", frames, reconstruction, posterior, accelerator.unwrap_model(model).last_layer, use_discriminator)
             accelerator.backward(generator_loss)
-            accelerator.clip_grad_norm_(list(model.parameters()) + [raw_criterion.logvar], 1.0)
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
             generator_optimizer.step(); generator_scheduler.step()
 
             for parameter in raw_criterion.discriminator.parameters():
                 parameter.requires_grad_(True)
             discriminator_optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
-                discriminator_loss = criterion("discriminator", frames, reconstruction, use_discriminator)
+                discriminator_loss, discriminator_details = criterion(
+                    "discriminator", frames, reconstruction, use_discriminator
+                )
             accelerator.backward(discriminator_loss)
             accelerator.clip_grad_norm_(raw_criterion.discriminator.parameters(), 1.0)
             discriminator_optimizer.step(); discriminator_scheduler.step()
 
-            values = {"total": generator_loss.detach(), "discriminator": discriminator_loss.detach(), **details}
+            values = {
+                "total": generator_loss.detach(),
+                "discriminator": discriminator_loss.detach(),
+                **details,
+                **discriminator_details,
+            }
             reduced = {key: accelerator.gather(value.float().reshape(1)).mean().item() for key, value in values.items()}
             for key, value in reduced.items(): sums[key] += value
             batches += 1; step += 1
             if accelerator.is_main_process and step % args.log_every == 0:
                 current_lr = generator_optimizer.param_groups[0]["lr"]
-                progress.set_postfix(loss=f"{reduced['total']:.4f}", rec=f"{reduced['reconstruction']:.5f}", lr=f"{current_lr:.2e}")
+                progress.set_postfix(
+                    gen=f"{reduced['total']:.4f}",
+                    disc=f"{reduced['discriminator']:.4f}",
+                    rec=f"{reduced['reconstruction']:.5f}",
+                    lr=f"{current_lr:.2e}",
+                )
                 if wandb_run is not None:
-                    wandb_run.log({f"Train/{key}": value for key, value in reduced.items()} | {"Train/lr": current_lr}, step=step)
+                    wandb_run.log({
+                        "train_gen_loss": reduced["total"],
+                        "train_disc_loss": reduced["discriminator"],
+                        "train/logvar": reduced["logvar"],
+                        "train/kl_loss": reduced["kl"],
+                        "train/nll_loss": reduced["nll"],
+                        "train/rec_loss": reduced["reconstruction"],
+                        "train/d_weight": reduced["adaptive"],
+                        "train/disc_factor": reduced["disc_factor"],
+                        "train/g_loss": reduced["gan"],
+                        "train/logits_real": reduced["logits_real"],
+                        "train/logits_fake": reduced["logits_fake"],
+                        "learning_rate": current_lr,
+                    }, step=step)
 
         epoch_losses = {key: value / max(batches, 1) for key, value in sums.items()}
-        validation = validate(accelerator, model, criterion, val_loader, thresholds, args.val_limit)
+        validation = validate(
+            accelerator, model, criterion, val_loader, thresholds, args.val_limit,
+            use_discriminator=epoch > args.disc_start_epoch,
+        )
         if accelerator.is_main_process:
             val_loss = float(validation["generator_loss"])
             csi = float(validation["csi"])
@@ -355,9 +436,35 @@ def main():
             record = {"epoch": epoch + 1, "step": step, "best_val_loss": best_val_loss, "best_csi": best_csi, "validation": validation, "training": epoch_losses, "seconds": time.time()}
             with (workdir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
-            print(f"VAE epoch {epoch + 1}: train={epoch_losses['total']:.6f} val_generator_loss={val_loss:.6f} best_val_loss={best_val_loss:.6f} val_csi={csi:.6f} best_csi={best_csi:.6f}", flush=True)
+            print(
+                f"VAE epoch {epoch + 1}: train_gen={epoch_losses['total']:.6f} "
+                f"train_disc={epoch_losses['discriminator']:.6f} "
+                f"val_total={validation['total_loss']:.6f} "
+                f"val_gen={val_loss:.6f} val_disc={validation['discriminator_loss']:.6f} "
+                f"best_val_loss={best_val_loss:.6f} val_csi={csi:.6f} best_csi={best_csi:.6f}",
+                flush=True,
+            )
             if wandb_run is not None:
-                wandb_run.log({f"Epoch/{key}": value for key, value in epoch_losses.items()} | {"Validation/Generator_Loss": val_loss, "Validation/Best_Generator_Loss": best_val_loss, "Validation/CSI": csi, "Validation/L1": validation["l1"], "Validation/MSE": validation["mse"], "Validation/Best_CSI": best_csi}, step=step)
+                wandb_run.log({
+                    "val_total_loss": validation["total_loss"],
+                    "val_gen_loss": val_loss,
+                    "val_disc_loss": validation["discriminator_loss"],
+                    "val/logvar": validation["logvar"],
+                    "val/kl_loss": validation["kl"],
+                    "val/nll_loss": validation["nll"],
+                    "val/rec_loss": validation["reconstruction"],
+                    "val/d_weight": validation["d_weight"],
+                    "val/disc_factor": validation["disc_factor"],
+                    "val/g_loss": validation["g_loss"],
+                    "val/logits_real": validation["logits_real"],
+                    "val/logits_fake": validation["logits_fake"],
+                    "Validation/Best_Generator_Loss": best_val_loss,
+                    "Validation/CSI": csi,
+                    "Validation/L1": validation["l1"],
+                    "Validation/MSE": validation["mse"],
+                    "Validation/Best_CSI": best_csi,
+                    **{f"Epoch/{key}": value for key, value in epoch_losses.items()},
+                }, step=step)
         accelerator.wait_for_everyone()
     if wandb_run is not None:
         wandb_run.finish()
