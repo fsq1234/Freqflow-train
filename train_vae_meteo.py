@@ -1,8 +1,8 @@
 """Train the factor-four radar AutoencoderKL used before latent FreqFlow.
 
 This is intentionally a separate stage from ``train_nowcast_alphapre.py``.
-It follows FlowCast's KL-VAE plus PatchGAN objective, but uses PreDiff's
-deterministic frame expansion: every Meteo event frame is an individual sample.
+It follows FlowCast's KL-VAE, PatchGAN, and random-one-frame-per-event
+sampling, while retaining the factor-four latent interface required by FreqFlow.
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def parse_args():
     parser.add_argument("--disc-weight", type=float, default=0.5)
     parser.add_argument("--disc-start-epoch", type=int, default=35)
     parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="no")
-    parser.add_argument("--val-limit", type=int, default=0, help="0 validates every frame")
+    parser.add_argument("--val-limit", type=int, default=0, help="0 validates every sampled event")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="freqflow-meteo-vae")
@@ -293,7 +293,8 @@ def main():
     if accelerator.is_main_process:
         (workdir / "vae_config.json").write_text(json.dumps(config.as_dict(), indent=2), encoding="utf-8")
         print(f"Meteo VAE: 1x{args.img_size}x{args.img_size} -> {args.latent_channels}x32x32", flush=True)
-        print(f"Train frames: {len(train_dataset)}; validation frames: {len(val_dataset)}", flush=True)
+        print(f"Train events / epoch: {len(train_dataset)}; validation events / epoch: {len(val_dataset)}", flush=True)
+        print("VAE sampling: one random frame per event per epoch (FlowCast style)", flush=True)
         print(f"FlowCast schedule: epochs={args.epochs}, warmup={args.warmup_ratio:.0%}, GAN after epoch {args.disc_start_epoch}", flush=True)
         print(f"Mixed Precision: {args.mixed_precision}", flush=True)
     wandb_run = init_wandb(args, workdir, accelerator)

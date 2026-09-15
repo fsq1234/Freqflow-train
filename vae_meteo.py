@@ -2,8 +2,9 @@
 
 The data transform intentionally matches ``alphapre_compat.dataset_meteonet``:
 raw uint8 radar / 90.0 followed by ``torchvision.transforms.Resize(128)``.
-Each dataset item is one frame, even though the source HDF5 stores 25-frame
-events.  This keeps VAE memory independent of the event length.
+Each dataset item is one randomly selected frame from one source event, as in
+FlowCast's VAE training.  This keeps VAE memory independent of event length
+without expanding one 25-frame Meteo event into 25 optimizer samples.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import h5py
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -97,11 +99,12 @@ class RadarAutoencoder(nn.Module):
 
 
 class MeteoFrameDataset(Dataset):
-    """Expose every frame of each AlphaPre Meteo event as one VAE sample.
+    """Expose one randomly selected frame of each Meteo event per epoch.
 
     The underlying HDF5 is opened inside ``__getitem__`` to remain safe with
     PyTorch worker processes.  ``split='val'`` deliberately follows AlphaPre's
-    current Meteo contract and reads the ``test`` group.
+    current Meteo contract and reads the ``test`` group.  Its event-level
+    length and random frame selection follow FlowCast's VAE dataset behavior.
     """
 
     def __init__(self, data_path: str | Path, split: str, image_size: int = 128):
@@ -120,10 +123,10 @@ class MeteoFrameDataset(Dataset):
             raise ValueError("Meteo events must contain at least one frame")
 
     def __len__(self) -> int:
-        return self.num_events * self.frames_per_event
+        return self.num_events
 
-    def __getitem__(self, index: int):
-        event_index, frame_index = divmod(index, self.frames_per_event)
+    def __getitem__(self, event_index: int):
+        frame_index = int(np.random.randint(0, self.frames_per_event))
         with h5py.File(self.data_path, "r") as handle:
             frame = handle[self.split][str(event_index)][frame_index]
         frame = torch.from_numpy(frame).float().div_(PIXEL_SCALE)
