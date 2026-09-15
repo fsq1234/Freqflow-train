@@ -89,25 +89,26 @@ class FlowCastVAELoss(nn.Module):
 
     def generator_loss(self, source, reconstruction, posterior, last_layer, use_discriminator):
         nll, rec, kl = self.reconstruction_terms(source, reconstruction, posterior)
-        if use_discriminator:
-            logits_fake = self.discriminator(reconstruction)
-            gan = -logits_fake.mean()
-            nll_grad = torch.autograd.grad(nll, last_layer, retain_graph=True)[0]
-            gan_grad = torch.autograd.grad(gan, last_layer, retain_graph=True)[0]
-            adaptive = (nll_grad.norm() / (gan_grad.norm() + 1.0e-4)).clamp(0.0, 1.0e4).detach()
-            adaptive = adaptive * self.disc_weight
-        else:
-            adaptive = torch.zeros((), device=source.device)
-            gan = torch.zeros((), device=source.device)
-        total = nll + self.kl_weight * kl + adaptive * gan if use_discriminator else nll + self.kl_weight * kl
+        # FlowCast and PreDiff run the PatchGAN computation during warmup too,
+        # then multiply its contribution by zero.  Keeping this graph makes the
+        # corresponding discriminator backward pass valid while its gradients
+        # remain identically zero before activation.
+        logits_fake = self.discriminator(reconstruction)
+        gan = -logits_fake.mean()
+        nll_grad = torch.autograd.grad(nll, last_layer, retain_graph=True)[0]
+        gan_grad = torch.autograd.grad(gan, last_layer, retain_graph=True)[0]
+        adaptive = (nll_grad.norm() / (gan_grad.norm() + 1.0e-4)).clamp(0.0, 1.0e4).detach()
+        adaptive = adaptive * self.disc_weight
+        disc_factor = 1.0 if use_discriminator else 0.0
+        total = nll + self.kl_weight * kl + adaptive * disc_factor * gan
         return total, {"reconstruction": rec.detach(), "kl": kl.detach(), "gan": gan.detach(), "adaptive": adaptive.detach()}
 
     def discriminator_loss(self, source, reconstruction, use_discriminator):
-        if not use_discriminator:
-            return torch.zeros((), device=source.device)
         real = self.discriminator(source.detach())
         fake = self.discriminator(reconstruction.detach())
-        return 0.5 * (F.relu(1.0 - real).mean() + F.relu(1.0 + fake).mean())
+        hinge = 0.5 * (F.relu(1.0 - real).mean() + F.relu(1.0 + fake).mean())
+        disc_factor = 1.0 if use_discriminator else 0.0
+        return disc_factor * hinge
 
     def forward(self, mode, *args):
         """Route updates through ``forward`` so DDP synchronizes this module."""
