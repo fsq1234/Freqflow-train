@@ -26,7 +26,9 @@ export FREQFLOW_WEIGHT_DECAY=0.0
 export FREQFLOW_WARMUP_STEPS=1000
 export FREQFLOW_EMA_RATE=0.95
 export FREQFLOW_EMA_UPDATE_EVERY=20
-export FREQFLOW_MIXED_PRECISION=fp16
+# BF16 keeps the same 2-byte activation footprint as FP16 on this RTX 4000-series
+# GPU, while providing a much wider exponent range for long FreqFlow training.
+export FREQFLOW_MIXED_PRECISION=bf16
 export FREQFLOW_SAMPLE_STEPS=20
 export PYTHONUNBUFFERED=1
 export FREQFLOW_LOG_EVERY=20

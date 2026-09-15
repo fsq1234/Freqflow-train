@@ -370,6 +370,7 @@ def main():
         print(f"Total Epochs: {args.epochs}", flush=True)
         print("Optimizer: AdamW (betas=(0.9, 0.95))", flush=True)
         print(f"Learning Rate: {args.lr}", flush=True)
+        print(f"Mixed Precision: {args.mixed_precision}", flush=True)
         print(f"Pixel Scale: {pixel_scale}", flush=True)
         print(f"Thresholds: {thresholds}", flush=True)
         print("Model: original full-capacity FreqFlow nowcast backbone", flush=True)
