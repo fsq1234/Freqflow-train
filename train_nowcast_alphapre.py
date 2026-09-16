@@ -1,4 +1,4 @@
-"""Conditional FreqFlow training with vendored AlphaPre radar data/metrics."""
+"""Train conditional FreqFlow on frozen Meteo VAE latents."""
 
 import argparse
 import copy
@@ -12,22 +12,26 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from tqdm import tqdm
 import utils
-from alphapre_compat import get_datasets, metrics, metrics_valid
+from alphapre_compat import metrics, metrics_valid
+from alphapre_compat.dataset_meteo_latent import MeteoLatent, PIXEL_SCALE, THRESHOLDS
 from configs.freqflow_nowcast_alphapre import get_config as get_nowcast_config
 from fft2d import Fourier_filter
 from sde import multi_scale_targets
+from vae_meteo import load_vae_checkpoint
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=("sevir", "meteo"), default="sevir")
+    parser.add_argument("--dataset", choices=("meteo",), default="meteo")
     parser.add_argument(
         "--data-path", required=True,
-        help="SEVIR root (CATALOG.csv plus data/) or MeteoNet meteo_radar.h5 file",
+        help="precomputed meteo_latent_vae32.h5",
     )
-    parser.add_argument("--workdir", default="workdir/freqflow_cond_fs_sevir_5to20")
+    parser.add_argument("--raw-data-path", required=True, help="original meteo_radar.h5 used as metric truth")
+    parser.add_argument("--vae-checkpoint", required=True, help="frozen Meteo VAE best_val_loss.pt")
+    parser.add_argument("--workdir", default="workdir/freqflow_meteo_vae32_5to20")
     parser.add_argument("--img-size", type=int, default=128)
-    parser.add_argument("--stride", type=int, default=13, help="SEVIR sequence stride; unused for MeteoNet")
+    parser.add_argument("--stride", type=int, default=13, help="legacy launcher option; unused for MeteoNet")
     parser.add_argument("--frames-in", type=int, default=5)
     parser.add_argument("--frames-out", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -39,6 +43,7 @@ def parse_args():
     parser.add_argument("--ema-rate", type=float, default=0.95)
     parser.add_argument("--ema-update-every", type=int, default=20)
     parser.add_argument("--sample-steps", type=int, default=20)
+    parser.add_argument("--decode-batch-size", type=int, default=20, help="frames decoded per frozen-VAE call")
     parser.add_argument("--log-every", type=int, default=20, help="write terminal/W&B training progress every N steps")
     parser.add_argument("--use-wandb", action="store_true", help="enable Weights & Biases experiment tracking")
     parser.add_argument("--wandb-project", default="freqflow-nowcast", help="Weights & Biases project name")
@@ -52,19 +57,30 @@ def parse_args():
         "--final-test-checkpoint", choices=("last", "best"), default="last",
         help="EMA checkpoint evaluated automatically on the full test set after training",
     )
+    parser.add_argument("--skip-final-test", action="store_true", help="skip only the automatic post-training full test")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def build_freqflow(frames_in, frames_out, img_size):
-    """Build the full-capacity original FreqFlow backbone for radar frames."""
+def build_freqflow(frames_in, frames_out, img_size, latent_channels, latent_size):
+    """Build the full-capacity original FreqFlow backbone for radar latents."""
     config = get_nowcast_config()
-    if (img_size, frames_in, frames_out) != (config.img_size, config.frames_in, config.frames_out):
+    actual = (img_size, frames_in, frames_out, latent_channels, latent_size)
+    expected = (
+        config.radar_img_size, config.frames_in, config.frames_out,
+        config.latent_channels, config.latent_size,
+    )
+    if actual != expected:
         raise ValueError(
-            "the full-capacity nowcast config is fixed to 128px, 5 input frames, and 20 output frames"
+            "the full-capacity latent config is fixed to 128px radar, 5 input frames, "
+            "20 output frames, and 4x32x32 latents"
         )
     model_args = copy.deepcopy(config.nnet.model_args)
+    if model_args.channels != frames_out * latent_channels:
+        raise ValueError("model output channels do not match frames_out * latent_channels")
+    if model_args.history_channels != frames_in * latent_channels:
+        raise ValueError("model history channels do not match frames_in * latent_channels")
     return utils.get_nnet(name=config.nnet.name, model_args=model_args)
 
 
@@ -87,7 +103,9 @@ def make_run_config(args):
     return {
         "model": as_plain_config(config.nnet.model_args),
         "task": {
-            "img_size": config.img_size,
+            "radar_img_size": config.radar_img_size,
+            "latent_size": config.latent_size,
+            "latent_channels": config.latent_channels,
             "frames_in": config.frames_in,
             "frames_out": config.frames_out,
         },
@@ -149,39 +167,37 @@ def mean_epoch_losses(accelerator, loss_sums, loss_count):
     }
 
 
-def build_loaders(dataset_name, data_path, img_size, stride, batch_size, num_workers):
-    """Use AlphaPre's original reader and loader contract for each radar set."""
-    get_datasets.DATAPATH[dataset_name] = data_path
-    train, valid, test, _, pixel_scale, thresholds = get_datasets.get_dataset(
-        data_name=dataset_name, img_size=img_size, seq_len=25,
-        batch_size=batch_size, stride=stride,
+def build_loaders(data_path, raw_data_path, img_size, frames_in, frames_out, batch_size, num_workers):
+    """Build worker-safe latent loaders and raw-target validation loaders."""
+    common = dict(
+        latent_path=data_path, raw_data_path=raw_data_path, image_size=img_size,
+        frames_in=frames_in, frames_out=frames_out,
     )
-    if dataset_name == "sevir":
-        # SEVIR already batches internally, exactly as AlphaPre does.
-        train_loader = train.get_torch_dataloader(num_workers=num_workers)
-        valid_loader = valid.get_torch_dataloader(num_workers=num_workers)
-        test_loader = test.get_torch_dataloader(num_workers=num_workers)
-    elif dataset_name == "meteo":
-        # This is AlphaPre's non-SEVIR loader behavior (grad accumulation is
-        # one in this entrypoint, so its train batch is batch_size directly).
-        train_loader = torch.utils.data.DataLoader(
-            train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True,
-        )
-        valid_loader = torch.utils.data.DataLoader(
-            valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True,
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        )
-    else:
-        raise ValueError(f"unsupported dataset: {dataset_name}")
-    return (
-        train_loader,
-        valid_loader,
-        test_loader,
-        pixel_scale,
-        thresholds,
+    train = MeteoLatent(split="train", return_pixels=False, **common)
+    valid = MeteoLatent(split="val", return_pixels=True, **common)
+    test = MeteoLatent(split="test", return_pixels=True, **common)
+    contract = {
+        "latent_channels": train.latent_channels,
+        "latent_height": train.latent_height,
+        "latent_width": train.latent_width,
+        "latent_mean": train.latent_mean,
+        "latent_std": train.latent_std,
+        "vae_image_size": train.vae_image_size,
+        "vae_latent_channels": train.vae_latent_channels,
+    }
+    train_loader = torch.utils.data.DataLoader(
+        train, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, drop_last=True,
     )
+    valid_loader = torch.utils.data.DataLoader(
+        valid, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, drop_last=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True,
+    )
+    return train_loader, valid_loader, test_loader, PIXEL_SCALE, THRESHOLDS, contract
 
 
 def scale_corrected_target(value, output_height):
@@ -218,25 +234,57 @@ def conditional_freqflow_loss(model, history, future):
 
 
 @torch.no_grad()
-def sample_future(model, history, frames_out, sample_steps):
-    state = torch.randn(history.shape[0], frames_out, *history.shape[-2:], device=history.device, dtype=history.dtype)
+def sample_future(model, history, future_channels, sample_steps):
+    state = torch.randn(
+        history.shape[0], future_channels, *history.shape[-2:],
+        device=history.device, dtype=history.dtype,
+    )
     dt = 1.0 / sample_steps
     for step in range(sample_steps):
         t = torch.full((state.shape[0],), step * dt, device=state.device, dtype=state.dtype)
         velocity = model(state, log_snr=t * 8.0 - 4.0, history=history)[-1]
         state = state + dt * velocity
-    return state.clamp_(0.0, 1.0)
+    return state
 
 
-def split_batch(batch, frames_in, frames_out, device):
-    # AlphaPre returns [B, 25, 1, H, W].  FreqFlow uses time as the channel
-    # axis, so the singleton VIL channel is removed after validating it.
+def split_batch(batch, frames_in, frames_out, latent_channels, latent_mean, latent_std, device):
+    """Normalize [B,T,C,H,W] and flatten time/channel for FreqFlow."""
     sequence = batch[:, : frames_in + frames_out].to(device, non_blocking=True)
-    if sequence.ndim != 5 or sequence.shape[2] != 1:
-        raise ValueError(f"expected AlphaPre VIL [B,T,1,H,W], got {tuple(sequence.shape)}")
-    history = sequence[:, :frames_in, 0]
-    future = sequence[:, frames_in : frames_in + frames_out, 0]
+    if sequence.ndim != 5 or sequence.shape[2] != latent_channels:
+        raise ValueError(
+            f"expected latent [B,T,{latent_channels},H,W], got {tuple(sequence.shape)}"
+        )
+    sequence = (sequence - latent_mean) / latent_std
+    batch_size, _, _, height, width = sequence.shape
+    history = sequence[:, :frames_in].reshape(
+        batch_size, frames_in * latent_channels, height, width
+    )
+    future = sequence[:, frames_in : frames_in + frames_out].reshape(
+        batch_size, frames_out * latent_channels, height, width
+    )
     return history, future
+
+
+@torch.no_grad()
+def decode_future(
+    vae, normalized_latent, frames_out, latent_channels,
+    latent_mean, latent_std, decode_batch_size, accelerator,
+):
+    """Return decoded radar frames in AlphaPre's [B,T,1,H,W] contract."""
+    batch_size, channels, height, width = normalized_latent.shape
+    expected_channels = frames_out * latent_channels
+    if channels != expected_channels:
+        raise ValueError(f"expected {expected_channels} generated channels, got {channels}")
+    latent = normalized_latent.float().reshape(
+        batch_size * frames_out, latent_channels, height, width
+    )
+    latent = latent * latent_std + latent_mean
+    decoded = []
+    for start in range(0, latent.shape[0], decode_batch_size):
+        with accelerator.autocast():
+            decoded.append(vae.decode(latent[start : start + decode_batch_size]))
+    radar = torch.cat(decoded, dim=0).float().clamp_(0.0, 1.0)
+    return radar.reshape(batch_size, frames_out, 1, *radar.shape[-2:])
 
 
 def cosine_schedule(optimizer, warmup_steps, total_steps):
@@ -256,11 +304,13 @@ def update_ema(ema_model, model, rate):
 def evaluate(
     accelerator,
     model,
+    vae,
     loader,
     args,
     evaluator_cls,
     pixel_scale,
     thresholds,
+    latent_contract,
     limit=None,
     description="Evaluation",
 ):
@@ -276,13 +326,26 @@ def evaluate(
         leave=False,
         mininterval=1.0,
     )
-    for index, batch in enumerate(progress):
-        history, future = split_batch(batch, args.frames_in, args.frames_out, accelerator.device)
-        prediction = sample_future(model, history, args.frames_out, args.sample_steps)
-        # Restore AlphaPre's original [B, T, 1, H, W] metric interface.  The
-        # singleton VIL channel is removed only inside the FreqFlow backbone.
-        gathered_future = accelerator.gather_for_metrics(future).unsqueeze(2).cpu()
-        gathered_prediction = accelerator.gather_for_metrics(prediction).unsqueeze(2).cpu()
+    for index, (latent, future_pixels) in enumerate(progress):
+        history, _ = split_batch(
+            latent, args.frames_in, args.frames_out,
+            latent_contract["latent_channels"], latent_contract["latent_mean"],
+            latent_contract["latent_std"], accelerator.device,
+        )
+        with accelerator.autocast():
+            prediction = sample_future(
+                model, history, args.frames_out * latent_contract["latent_channels"],
+                args.sample_steps,
+            )
+        prediction_pixels = decode_future(
+            vae, prediction, args.frames_out, latent_contract["latent_channels"],
+            latent_contract["latent_mean"], latent_contract["latent_std"],
+            args.decode_batch_size, accelerator,
+        )
+        gathered_future = accelerator.gather_for_metrics(
+            future_pixels.to(accelerator.device, non_blocking=True)
+        ).float().cpu()
+        gathered_prediction = accelerator.gather_for_metrics(prediction_pixels).float().cpu()
         if accelerator.is_main_process:
             evaluator.evaluate(gathered_future, gathered_prediction)
         if limit is not None and index + 1 >= limit:
@@ -323,19 +386,40 @@ def main():
         raise ValueError("AlphaPre-compatible runs require --frames-in 5 --frames-out 20")
     if args.log_every < 1:
         raise ValueError("--log-every must be at least 1")
+    if args.decode_batch_size < 1:
+        raise ValueError("--decode-batch-size must be at least 1")
     torch.manual_seed(args.seed)
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
-    run_config = make_run_config(args)
     workdir = Path(args.workdir)
     if accelerator.is_main_process:
         workdir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
-    wandb_run = init_wandb(args, workdir, run_config, accelerator)
 
-    train_loader, valid_loader, test_loader, pixel_scale, thresholds = build_loaders(
-        args.dataset, args.data_path, args.img_size, args.stride, args.batch_size, args.num_workers
+    train_loader, valid_loader, test_loader, pixel_scale, thresholds, latent_contract = build_loaders(
+        args.data_path, args.raw_data_path, args.img_size, args.frames_in, args.frames_out,
+        args.batch_size, args.num_workers,
     )
-    model = build_freqflow(args.frames_in, args.frames_out, args.img_size)
+    latent_channels = latent_contract["latent_channels"]
+    latent_size = latent_contract["latent_height"]
+    if latent_contract["latent_width"] != latent_size:
+        raise ValueError("FreqFlow requires square latent frames")
+    if latent_contract["vae_latent_channels"] != latent_channels:
+        raise ValueError("latent HDF5 shape disagrees with its stored VAE config")
+    if latent_contract["vae_image_size"] != args.img_size:
+        raise ValueError("VAE image size disagrees with --img-size")
+
+    vae, _ = load_vae_checkpoint(args.vae_checkpoint, "cpu")
+    vae = vae.to(accelerator.device).eval()
+    if vae.config.latent_channels != latent_channels or vae.config.image_size != args.img_size:
+        raise ValueError("selected VAE checkpoint is incompatible with the latent HDF5")
+    vae.requires_grad_(False)
+
+    run_config = make_run_config(args)
+    run_config["latent_contract"] = as_plain_config(latent_contract)
+    wandb_run = init_wandb(args, workdir, run_config, accelerator)
+    model = build_freqflow(
+        args.frames_in, args.frames_out, args.img_size, latent_channels, latent_size,
+    )
     ema_model = copy.deepcopy(model).eval().to(accelerator.device)
     for parameter in ema_model.parameters():
         parameter.requires_grad_(False)
@@ -373,7 +457,17 @@ def main():
         print(f"Mixed Precision: {args.mixed_precision}", flush=True)
         print(f"Pixel Scale: {pixel_scale}", flush=True)
         print(f"Thresholds: {thresholds}", flush=True)
-        print("Model: original full-capacity FreqFlow nowcast backbone", flush=True)
+        print(
+            f"Latent contract: {args.frames_in}x{latent_channels} -> "
+            f"{args.frames_out}x{latent_channels} at {latent_size}x{latent_size}",
+            flush=True,
+        )
+        print(
+            f"Latent normalization: mean={latent_contract['latent_mean']:.8f}, "
+            f"std={latent_contract['latent_std']:.8f}", flush=True,
+        )
+        print(f"Frozen VAE: {args.vae_checkpoint}", flush=True)
+        print("Model: original full-capacity FreqFlow backbone in VAE space", flush=True)
         print(f"Workdir: {workdir}", flush=True)
         if args.resume:
             print(f"Resume checkpoint: {args.resume}", flush=True)
@@ -410,7 +504,11 @@ def main():
             mininterval=1.0,
         )
         for batch_index, batch in enumerate(train_pbar, start=1):
-            history, future = split_batch(batch, args.frames_in, args.frames_out, accelerator.device)
+            history, future = split_batch(
+                batch, args.frames_in, args.frames_out, latent_channels,
+                latent_contract["latent_mean"], latent_contract["latent_std"],
+                accelerator.device,
+            )
             with accelerator.autocast():
                 loss, losses = conditional_freqflow_loss(model, history, future)
             accelerator.backward(loss)
@@ -465,8 +563,9 @@ def main():
         validation = None
         if args.valid:
             validation = evaluate(
-                accelerator, ema_model, valid_loader, args, metrics_valid.Evaluator,
-                pixel_scale, thresholds, args.vlnum if args.valid_limit else None,
+                accelerator, ema_model, vae, valid_loader, args, metrics_valid.Evaluator,
+                pixel_scale, thresholds, latent_contract,
+                args.vlnum if args.valid_limit else None,
                 description=f"Epoch {epoch + 1}/{args.epochs} [Val]",
             )
             if accelerator.is_main_process and validation["csi"] > best_csi:
@@ -513,7 +612,7 @@ def main():
 
     # AlphaPre's full evaluator is intentionally used only after training; its
     # additional LPIPS/SSIM/CRPS reporting is too expensive for every epoch.
-    if args.valid:
+    if args.valid and not args.skip_final_test:
         accelerator.wait_for_everyone()
         final_checkpoint_path = workdir / "checkpoints" / f"{args.final_test_checkpoint}.pt"
         if not final_checkpoint_path.is_file():
@@ -523,11 +622,13 @@ def main():
         results = evaluate(
             accelerator,
             ema_model,
+            vae,
             test_loader,
             args,
             metrics.Evaluator,
             pixel_scale,
             thresholds,
+            latent_contract,
             description=f"Final test ({args.final_test_checkpoint}.pt EMA)",
         )
         if accelerator.is_main_process:

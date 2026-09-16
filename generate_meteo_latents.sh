@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export FREQFLOW_DATA_PATH=/mnt/sdb1/user/WRF/stlP/data/meteo_radar.h5
 # Set this to the selected VAE checkpoint before running this script.
 export FREQFLOW_VAE_CHECKPOINT="${FREQFLOW_VAE_CHECKPOINT:-}"
-export FREQFLOW_LATENT_PATH="${FREQFLOW_LATENT_PATH:-/mnt/sdb1/user/WRF/stlP/data/meteo_latent_vae32.h5}"
+export FREQFLOW_LATENT_PATH="${FREQFLOW_LATENT_PATH:-${SCRIPT_DIR}/data/meteo_latent_vae32.h5}"
 export FREQFLOW_ENCODE_BATCH_SIZE="${FREQFLOW_ENCODE_BATCH_SIZE:-32}"
 export FREQFLOW_ENCODE_WORKERS="${FREQFLOW_ENCODE_WORKERS:-2}"
 

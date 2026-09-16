@@ -1,9 +1,9 @@
-"""Full-capacity FreqFlow configuration for AlphaPre-style SEVIR nowcasting.
+"""Full-capacity FreqFlow configuration for VAE-space Meteo nowcasting.
 
 The Transformer/ConvNeXt widths, depths, heads, hidden dimensions, kernels,
-normalization and dropout are retained from ``configs/freqflow.py``. Only the
-task interface and spatial sizes differ: 20 future-frame channels, five history
-channels, and 128px radar frames rather than 32px SD-VAE latents.
+normalization and dropout are retained from ``configs/freqflow.py``.  Five
+observed and twenty future radar frames each carry four VAE channels, so time
+and latent channels are flattened to 20 conditioning and 80 generated channels.
 """
 
 from dataclasses import dataclass
@@ -17,8 +17,8 @@ class Args:
 
 
 model = Args(
-    channels=20,
-    history_channels=5,
+    channels=80,
+    history_channels=20,
     history_feature_dim=64,
     block_grad_to_lowres=False,
     norm_type="TDRMSN",
@@ -29,10 +29,10 @@ model = Args(
             hidden_dim=1920,
             num_attention_heads=16,
             num_blocks=39,
-            # A 128px state enters the frequency branch at 32px.
-            max_height=32,
-            max_width=32,
-            image_input_ratio=2,
+            # Match the original FreqFlow latent geometry: 32px -> 16px.
+            max_height=16,
+            max_width=16,
+            image_input_ratio=1,
             input_feature_ratio=2,
             final_kernel_size=3,
             dropout_prob=0,
@@ -43,8 +43,8 @@ model = Args(
             hidden_dim=960,
             kernel_size=7,
             num_blocks=20,
-            max_height=128,
-            max_width=128,
+            max_height=32,
+            max_width=32,
             image_input_ratio=1,
             input_feature_ratio=1,
             final_kernel_size=3,
@@ -56,7 +56,9 @@ model = Args(
 
 def get_config():
     return Args(
-        img_size=128,
+        radar_img_size=128,
+        latent_size=32,
+        latent_channels=4,
         frames_in=5,
         frames_out=20,
         nnet=Args(name="freqflow", model_args=model),

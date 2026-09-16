@@ -8,6 +8,8 @@ PROJECT_DIR="${FREQFLOW_PROJECT_DIR:-${SCRIPT_DIR}}"
 MANAGER_NAME="${FREQFLOW_MANAGER_NAME:-$(basename -- "$0")}"
 DATASET="${FREQFLOW_DATASET:?Set FREQFLOW_DATASET in a dataset launcher.}"
 DATA_PATH="${FREQFLOW_DATA_PATH:?Set FREQFLOW_DATA_PATH in a dataset launcher.}"
+RAW_DATA_PATH="${FREQFLOW_RAW_DATA_PATH:-}"
+VAE_CHECKPOINT="${FREQFLOW_VAE_CHECKPOINT:-}"
 RUN_GROUP="${FREQFLOW_RUN_GROUP:-${DATASET}-5to20}"
 RUNS_DIR="${FREQFLOW_RUNS_DIR:-${PROJECT_DIR}/runs}"
 ACCELERATE_BIN="${FREQFLOW_ACCELERATE_BIN:-accelerate}"
@@ -25,6 +27,7 @@ WARMUP_STEPS="${FREQFLOW_WARMUP_STEPS:-1000}"
 EMA_RATE="${FREQFLOW_EMA_RATE:-0.95}"
 EMA_UPDATE_EVERY="${FREQFLOW_EMA_UPDATE_EVERY:-20}"
 SAMPLE_STEPS="${FREQFLOW_SAMPLE_STEPS:-20}"
+DECODE_BATCH_SIZE="${FREQFLOW_DECODE_BATCH_SIZE:-20}"
 LOG_EVERY="${FREQFLOW_LOG_EVERY:-20}"
 USE_WANDB="${FREQFLOW_USE_WANDB:-1}"
 WANDB_PROJECT="${FREQFLOW_WANDB_PROJECT:-freqflow-nowcast}"
@@ -36,6 +39,7 @@ VALIDATE="${FREQFLOW_VALIDATE:-1}"
 VALID_LIMIT="${FREQFLOW_VALID_LIMIT:-0}"
 VLNUM="${FREQFLOW_VLNUM:-10}"
 FINAL_TEST_CHECKPOINT="${FREQFLOW_FINAL_TEST_CHECKPOINT:-last}"
+RUN_FINAL_TEST="${FREQFLOW_RUN_FINAL_TEST:-1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -58,11 +62,12 @@ validate_setup() {
     [[ -f "${PROJECT_DIR}/train_nowcast_alphapre.py" ]] || die "not a FreqFlow project: ${PROJECT_DIR}"
     case "${DATASET}" in
         sevir)
-            [[ -f "${DATA_PATH}/CATALOG.csv" ]] || die "SEVIR CATALOG.csv not found under: ${DATA_PATH}"
-            [[ -d "${DATA_PATH}/data" ]] || die "SEVIR data/ directory not found under: ${DATA_PATH}"
+            die "this VAE branch currently has a generated latent contract only for MeteoNet"
             ;;
         meteo)
-            [[ -f "${DATA_PATH}" ]] || die "MeteoNet HDF5 file not found: ${DATA_PATH}"
+            [[ -f "${DATA_PATH}" ]] || die "MeteoNet latent HDF5 not found: ${DATA_PATH}"
+            [[ -f "${RAW_DATA_PATH}" ]] || die "MeteoNet raw HDF5 not found: ${RAW_DATA_PATH}"
+            [[ -f "${VAE_CHECKPOINT}" ]] || die "Meteo VAE checkpoint not found: ${VAE_CHECKPOINT}"
             ;;
         *)
             die "unsupported dataset: ${DATASET}"
@@ -83,6 +88,8 @@ make_launch_command() {
         train_nowcast_alphapre.py
         --dataset "${DATASET}"
         --data-path "${DATA_PATH}"
+        --raw-data-path "${RAW_DATA_PATH}"
+        --vae-checkpoint "${VAE_CHECKPOINT}"
         --workdir "${RUN_DIR}"
         --img-size "${IMG_SIZE}"
         --stride "${STRIDE}"
@@ -97,6 +104,7 @@ make_launch_command() {
         --ema-rate "${EMA_RATE}"
         --ema-update-every "${EMA_UPDATE_EVERY}"
         --sample-steps "${SAMPLE_STEPS}"
+        --decode-batch-size "${DECODE_BATCH_SIZE}"
         --log-every "${LOG_EVERY}"
         --mixed-precision "${MIXED_PRECISION}"
         --seed "${SEED}"
@@ -122,6 +130,9 @@ make_launch_command() {
             --wandb-group "${WANDB_GROUP}"
         )
     fi
+    if [[ "${RUN_FINAL_TEST}" != "1" ]]; then
+        LAUNCH_CMD+=(--skip-final-test)
+    fi
     return 0
 }
 
@@ -132,15 +143,18 @@ write_run_config() {
         echo "Time: $(date)"
         echo "Dataset: ${DATASET}"
         echo "Data path: ${DATA_PATH}"
+        echo "Raw metric data: ${RAW_DATA_PATH}"
+        echo "Frozen VAE: ${VAE_CHECKPOINT}"
         echo "Project: ${PROJECT_DIR}"
         echo "Visible GPUs: ${CUDA_VISIBLE_DEVICES:-all}"
         echo "Processes: ${NUM_PROCESSES}"
         echo "Frames: ${FRAMES_IN} input + ${FRAMES_OUT} future"
+        echo "VAE decode batch size: ${DECODE_BATCH_SIZE}"
         echo "Batch size per process: ${BATCH_SIZE}"
         echo "Mixed precision: ${MIXED_PRECISION}"
         echo "Progress log interval: ${LOG_EVERY} steps"
         echo "W&B: ${USE_WANDB} (project=${WANDB_PROJECT}, group=${WANDB_GROUP})"
-        echo "Automatic full-test checkpoint: ${FINAL_TEST_CHECKPOINT}.pt EMA"
+        echo "Automatic full test: ${RUN_FINAL_TEST} (checkpoint=${FINAL_TEST_CHECKPOINT}.pt EMA)"
         echo ""
         printf 'Command: '
         printf '%q ' "${LAUNCH_CMD[@]}"
@@ -172,6 +186,18 @@ start_training() {
     echo -e "${GREEN}Started PID: ${pid}${NC}"
     echo "Monitor: tail -f ${LOG_FILE}"
     echo "Status:  bash ${MANAGER_NAME} status"
+}
+
+smoke_training() {
+    EPOCHS=1
+    VALIDATE=1
+    VALID_LIMIT=1
+    VLNUM=2
+    RUN_FINAL_TEST=0
+    RUN_DIR="${RUNS_DIR}/${RUN_GROUP}-smoke/${TIMESTAMP}"
+    PID_FILE="${RUN_DIR}/train.pid"
+    LOG_FILE="${RUN_DIR}/logs/train.log"
+    start_training
 }
 
 resolve_resume_target() {
@@ -255,13 +281,14 @@ show_status() {
 }
 
 usage() {
-    echo "Usage: bash ${MANAGER_NAME} [start|resume [run_dir|checkpoint]|stop|status|dir]"
+    echo "Usage: bash ${MANAGER_NAME} [smoke|start|resume [run_dir|checkpoint]|stop|status|dir]"
     echo ""
     echo "Override settings without editing, for example:"
     echo "  CUDA_VISIBLE_DEVICES=0 FREQFLOW_BATCH_SIZE=1 bash ${MANAGER_NAME} start"
 }
 
 case "${1:-}" in
+    smoke)  smoke_training ;;
     start)  start_training ;;
     resume) resume_training "${2:-}" ;;
     stop)   stop_training ;;

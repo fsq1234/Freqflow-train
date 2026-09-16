@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FreqFlow MeteoNet 5 -> 20 training manager.
+# VAE-space FreqFlow MeteoNet 5 -> 20 training manager.
 # Edit the values below only when this server's paths or hardware change.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,8 +7,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export FREQFLOW_PROJECT_DIR="${SCRIPT_DIR}"
 export FREQFLOW_MANAGER_NAME="$(basename -- "$0")"
 export FREQFLOW_DATASET=meteo
-export FREQFLOW_DATA_PATH=/mnt/sdb1/user/WRF/stlP/data/meteo_radar.h5
-export FREQFLOW_RUN_GROUP=meteo-5to20
+export FREQFLOW_DATA_PATH=/mnt/sdb1/user/FSQ/Freqflow-train/data/meteo_latent_vae32.h5
+export FREQFLOW_RAW_DATA_PATH=/mnt/sdb1/user/WRF/stlP/data/meteo_radar.h5
+export FREQFLOW_VAE_CHECKPOINT=/mnt/sdb1/user/FSQ/Freqflow-train/runs/meteo-vae32/20260915_220910/checkpoints/best_val_loss.pt
+export FREQFLOW_RUN_GROUP=meteo-vae32-5to20
 export CUDA_VISIBLE_DEVICES=0
 # Prefer the activated Conda C++ runtime over the host's older libstdc++.
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
@@ -30,15 +32,17 @@ export FREQFLOW_EMA_UPDATE_EVERY=20
 # GPU, while providing a much wider exponent range for long FreqFlow training.
 export FREQFLOW_MIXED_PRECISION=bf16
 export FREQFLOW_SAMPLE_STEPS=20
+export FREQFLOW_DECODE_BATCH_SIZE=20
 export PYTHONUNBUFFERED=1
 export FREQFLOW_LOG_EVERY=20
 export FREQFLOW_USE_WANDB=1
-export FREQFLOW_WANDB_PROJECT=freqflow-meteo-5to20
-export FREQFLOW_WANDB_GROUP=meteo-5to20
+export FREQFLOW_WANDB_PROJECT=freqflow-meteo-vae32-5to20
+export FREQFLOW_WANDB_GROUP=meteo-vae32-5to20
 export FREQFLOW_VALIDATE=1
 export FREQFLOW_VALID_LIMIT=0
 export FREQFLOW_VLNUM=10
 export FREQFLOW_FINAL_TEST_CHECKPOINT=last
+export FREQFLOW_RUN_FINAL_TEST=1
 export FREQFLOW_SEED=0
 
 exec bash "${SCRIPT_DIR}/_train_manager_common.sh" "$@"
