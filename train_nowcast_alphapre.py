@@ -362,7 +362,7 @@ def save_checkpoint(path, accelerator, model, ema_model, optimizer, scheduler, e
         "model": accelerator.unwrap_model(model).state_dict(),
         "ema": ema_model.state_dict(), "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(), "epoch": epoch, "step": step,
-        "best_csi": best_csi, "run_config": run_config,
+        "best_csi": float(best_csi), "run_config": run_config,
     }, path)
 
 
@@ -433,7 +433,11 @@ def main():
     start_epoch = step = 0
     best_csi = float("-inf")
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        # These are self-produced, trusted training checkpoints containing
+        # optimizer state and metadata.  PyTorch 2.6+ defaults to
+        # ``weights_only=True``, which rejects the NumPy scalar stored by older
+        # runs even though the checkpoint itself is valid.
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         accelerator.unwrap_model(model).load_state_dict(checkpoint["model"])
         ema_model.load_state_dict(checkpoint["ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -617,7 +621,9 @@ def main():
         final_checkpoint_path = workdir / "checkpoints" / f"{args.final_test_checkpoint}.pt"
         if not final_checkpoint_path.is_file():
             raise FileNotFoundError(f"final test checkpoint not found: {final_checkpoint_path}")
-        final_checkpoint = torch.load(final_checkpoint_path, map_location="cpu")
+        final_checkpoint = torch.load(
+            final_checkpoint_path, map_location="cpu", weights_only=False
+        )
         ema_model.load_state_dict(final_checkpoint["ema"])
         results = evaluate(
             accelerator,
