@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from tqdm import tqdm
 
@@ -51,6 +52,12 @@ def parse_args():
     parser.add_argument("--decode-batch-size", type=int, default=20)
     parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="bf16")
     parser.add_argument("--limit-batches", type=int, default=0, help="0 evaluates the complete test split")
+    parser.add_argument(
+        "--oracle-max-shift",
+        type=int,
+        default=24,
+        help="maximum absolute 128px-grid translation tested by the position oracle",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -301,6 +308,154 @@ class SpectralDiagnostics:
         }
 
 
+class OracleDiagnostics:
+    """Measure truth-assisted position/intensity correction upper bounds.
+
+    These are diagnostic oracles, not deployable forecast metrics.  Each frame
+    receives at most one global integer translation and/or one global positive
+    intensity multiplier selected using its ground truth.
+    """
+
+    def __init__(self, frames_out, thresholds, pixel_scale, max_shift):
+        self.frames_out = frames_out
+        self.max_shift = int(max_shift)
+        self.position = PixelDiagnostics(frames_out, thresholds, pixel_scale)
+        self.intensity = PixelDiagnostics(frames_out, thresholds, pixel_scale)
+        self.position_intensity = PixelDiagnostics(frames_out, thresholds, pixel_scale)
+        self.shift_dy_sum = np.zeros(frames_out, dtype=np.float64)
+        self.shift_dx_sum = np.zeros(frames_out, dtype=np.float64)
+        self.shift_distance_sum = np.zeros(frames_out, dtype=np.float64)
+        self.shift_count = np.zeros(frames_out, dtype=np.float64)
+        self.gain_sum = np.zeros(frames_out, dtype=np.float64)
+        self.aligned_gain_sum = np.zeros(frames_out, dtype=np.float64)
+        self.gain_count = np.zeros(frames_out, dtype=np.float64)
+
+    @staticmethod
+    def _zero_filled_shift(frame, dy, dx):
+        """Translate one [H,W] frame without wrapping pixels across edges."""
+        height, width = frame.shape
+        shifted = torch.zeros_like(frame)
+        source_y0 = max(0, -dy)
+        source_y1 = min(height, height - dy)
+        source_x0 = max(0, -dx)
+        source_x1 = min(width, width - dx)
+        target_y0 = max(0, dy)
+        target_y1 = min(height, height + dy)
+        target_x0 = max(0, dx)
+        target_x1 = min(width, width + dx)
+        if source_y1 > source_y0 and source_x1 > source_x0:
+            shifted[target_y0:target_y1, target_x0:target_x1] = frame[
+                source_y0:source_y1, source_x0:source_x1
+            ]
+        return shifted
+
+    def _position_align(self, prediction, truth):
+        pred = prediction[:, :, 0].float().cpu().clamp(0.0, 1.0)
+        true = truth[:, :, 0].float().cpu().clamp(0.0, 1.0)
+        batch, frames, height, width = pred.shape
+
+        # Smooth sqrt-intensity fields emphasize precipitation placement while
+        # reducing domination by a single extreme pixel.
+        pred_signal = F.avg_pool2d(
+            pred.sqrt().reshape(batch * frames, 1, height, width), 5, stride=1, padding=2
+        ).reshape(batch, frames, height, width)
+        true_signal = F.avg_pool2d(
+            true.sqrt().reshape(batch * frames, 1, height, width), 5, stride=1, padding=2
+        ).reshape(batch, frames, height, width)
+        correlation = torch.fft.ifft2(
+            torch.fft.fft2(true_signal) * torch.conj(torch.fft.fft2(pred_signal))
+        ).real
+        offsets = torch.arange(-self.max_shift, self.max_shift + 1)
+        y_indices = offsets.remainder(height)
+        x_indices = offsets.remainder(width)
+        candidates = correlation[..., y_indices[:, None], x_indices[None, :]]
+        best = candidates.reshape(batch, frames, -1).argmax(dim=-1)
+        side = offsets.numel()
+        dy = offsets[torch.div(best, side, rounding_mode="floor")]
+        dx = offsets[best % side]
+        valid = (pred_signal.square().sum(dim=(-2, -1)) > 1e-8) & (
+            true_signal.square().sum(dim=(-2, -1)) > 1e-8
+        )
+        dy = torch.where(valid, dy, torch.zeros_like(dy))
+        dx = torch.where(valid, dx, torch.zeros_like(dx))
+
+        aligned = torch.zeros_like(pred)
+        for batch_index in range(batch):
+            for lead_index in range(frames):
+                aligned[batch_index, lead_index] = self._zero_filled_shift(
+                    pred[batch_index, lead_index],
+                    int(dy[batch_index, lead_index]),
+                    int(dx[batch_index, lead_index]),
+                )
+        return aligned.unsqueeze(2), dy, dx, valid
+
+    @staticmethod
+    def _intensity_scale(prediction, truth):
+        pred = prediction.float().cpu().clamp(0.0, 1.0)
+        true = truth.float().cpu().clamp(0.0, 1.0)
+        true_energy = true.square().sum(dim=(-3, -2, -1))
+        pred_energy = pred.square().sum(dim=(-3, -2, -1))
+        gain = torch.where(
+            pred_energy > 1e-8,
+            torch.sqrt(true_energy / pred_energy.clamp_min(1e-8)),
+            torch.ones_like(pred_energy),
+        )
+        # Keep this an interpretable calibration oracle rather than allowing an
+        # unbounded multiplier on nearly empty predictions.
+        gain = gain.clamp(0.25, 4.0)
+        return (pred * gain[:, :, None, None, None]).clamp(0.0, 1.0), gain
+
+    def update(self, prediction, truth):
+        prediction = prediction.detach().float().cpu()
+        truth = truth.detach().float().cpu()
+        aligned, dy, dx, valid = self._position_align(prediction, truth)
+        scaled, gain = self._intensity_scale(prediction, truth)
+        aligned_scaled, aligned_gain = self._intensity_scale(aligned, truth)
+        self.position.update(aligned, truth)
+        self.intensity.update(scaled, truth)
+        self.position_intensity.update(aligned_scaled, truth)
+
+        valid_np = valid.numpy().astype(np.float64)
+        dy_np = dy.numpy().astype(np.float64)
+        dx_np = dx.numpy().astype(np.float64)
+        self.shift_dy_sum += (dy_np * valid_np).sum(axis=0)
+        self.shift_dx_sum += (dx_np * valid_np).sum(axis=0)
+        self.shift_distance_sum += (
+            np.sqrt(np.square(dy_np) + np.square(dx_np)) * valid_np
+        ).sum(axis=0)
+        self.shift_count += valid_np.sum(axis=0)
+        self.gain_sum += gain.numpy().sum(axis=0)
+        self.aligned_gain_sum += aligned_gain.numpy().sum(axis=0)
+        self.gain_count += gain.shape[0]
+
+    def finalize(self):
+        return {
+            "warning": (
+                "Truth-assisted diagnostic upper bounds only; do not report these as deployable model scores."
+            ),
+            "position_oracle": {
+                "definition": "one ground-truth-selected global integer translation per sample and lead",
+                "max_absolute_shift_pixels": self.max_shift,
+                "mean_dy_per_lead": _as_list(_divide(self.shift_dy_sum, self.shift_count)),
+                "mean_dx_per_lead": _as_list(_divide(self.shift_dx_sum, self.shift_count)),
+                "mean_shift_distance_pixels_per_lead": _as_list(
+                    _divide(self.shift_distance_sum, self.shift_count)
+                ),
+                "metrics": self.position.finalize(),
+            },
+            "intensity_oracle": {
+                "definition": "one ground-truth RMS-energy matching multiplier in [0.25,4] per sample and lead",
+                "mean_gain_per_lead": _as_list(_divide(self.gain_sum, self.gain_count)),
+                "metrics": self.intensity.finalize(),
+            },
+            "position_then_intensity_oracle": {
+                "definition": "position oracle followed by the same bounded intensity calibration",
+                "mean_gain_per_lead": _as_list(_divide(self.aligned_gain_sum, self.gain_count)),
+                "metrics": self.position_intensity.finalize(),
+            },
+        }
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -330,6 +485,8 @@ def main():
         raise ValueError("batch sizes and sample steps must be positive")
     if args.limit_batches < 0:
         raise ValueError("--limit-batches must be zero or positive")
+    if args.oracle_max_shift < 0 or args.oracle_max_shift >= args.img_size // 2:
+        raise ValueError("--oracle-max-shift must be in [0, img_size/2)")
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     process_seed = args.seed + accelerator.process_index
@@ -385,6 +542,9 @@ def main():
     vae_metrics = PixelDiagnostics(args.frames_out, THRESHOLDS, PIXEL_SCALE)
     forecast_spectrum = SpectralDiagnostics(args.frames_out, args.img_size, args.img_size)
     vae_spectrum = SpectralDiagnostics(args.frames_out, args.img_size, args.img_size)
+    oracle_metrics = OracleDiagnostics(
+        args.frames_out, THRESHOLDS, PIXEL_SCALE, args.oracle_max_shift
+    )
 
     total_batches = len(loader)
     if args.limit_batches:
@@ -446,6 +606,7 @@ def main():
                 vae_metrics.update(gathered_reconstruction, gathered_truth)
                 forecast_spectrum.update(gathered_prediction, gathered_truth)
                 vae_spectrum.update(gathered_reconstruction, gathered_truth)
+                oracle_metrics.update(gathered_prediction, gathered_truth)
             processed_batches += 1
     progress.close()
 
@@ -476,6 +637,8 @@ def main():
                 "vae_reconstruction": vae_spectrum.finalize(),
             },
         )
+        oracle_result = oracle_metrics.finalize()
+        write_json(output_dir / "oracle_diagnostics.json", oracle_result)
         write_json(
             output_dir / "summary.json",
             {
@@ -491,12 +654,14 @@ def main():
                 "processed_batches_per_process": processed_batches,
                 "num_sequences": forecast_result["num_sequences"],
                 "thresholds": list(THRESHOLDS),
+                "oracle_max_shift": args.oracle_max_shift,
                 "output_files": [
                     "metrics_per_lead.json",
                     "vae_upper_bound.json",
                     "intensity_bias.json",
                     "spatial_error.json",
                     "spectral_error.json",
+                    "oracle_diagnostics.json",
                 ],
             },
         )
@@ -505,9 +670,14 @@ def main():
         for threshold in THRESHOLDS:
             forecast_csi = forecast_result["categorical"][str(threshold)]["mean_csi_over_leads"]
             vae_csi = vae_result["categorical"][str(threshold)]["mean_csi_over_leads"]
+            position_csi = oracle_result["position_oracle"]["metrics"]["categorical"][str(threshold)]["mean_csi_over_leads"]
+            intensity_csi = oracle_result["intensity_oracle"]["metrics"]["categorical"][str(threshold)]["mean_csi_over_leads"]
+            combined_csi = oracle_result["position_then_intensity_oracle"]["metrics"]["categorical"][str(threshold)]["mean_csi_over_leads"]
             print(
                 f"Threshold {threshold}: forecast mean CSI={forecast_csi:.6f}; "
-                f"VAE reconstruction mean CSI={vae_csi:.6f}",
+                f"VAE reconstruction mean CSI={vae_csi:.6f}; "
+                f"position oracle={position_csi:.6f}; intensity oracle={intensity_csi:.6f}; "
+                f"combined oracle={combined_csi:.6f}",
                 flush=True,
             )
 

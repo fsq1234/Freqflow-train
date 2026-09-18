@@ -37,8 +37,8 @@ accelerate launch --multi_gpu --num_processes 8 --main_process_port $port --mixe
 After training, `analyze_nowcast_alphapre.py` compares the selected FreqFlow
 checkpoint with the frozen-VAE reconstruction upper bound on the complete
 Meteo test split.  The launcher writes per-lead categorical metrics, intensity
-bias, precipitation-centroid error, and radial spectral error without changing
-either checkpoint.
+bias, precipitation-centroid error, radial spectral error, and truth-assisted
+position/intensity correction upper bounds without changing either checkpoint.
 
 Set the two checkpoint paths, run a two-batch smoke test, and then run the full
 diagnostic:
@@ -57,6 +57,10 @@ bash analyze_meteonet_vae32.sh status
 `FREQFLOW_LIMIT_BATCHES=0` means the complete test split, and
 `FREQFLOW_CHECKPOINT_STATE=ema` is the default because training validation and
 the automatic final test also use EMA weights.
+
+`oracle_diagnostics.json` is diagnostic only: it uses ground truth to select a
+global translation and/or bounded intensity multiplier for each predicted
+frame.  These oracle values must not be reported as deployable model scores.
 
 ## Reference
 If you have any question, feel free to contact [Sucheng Ren](oliverrensu@gmail.com)
