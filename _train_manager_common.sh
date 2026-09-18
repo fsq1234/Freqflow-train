@@ -42,6 +42,7 @@ FINAL_TEST_CHECKPOINT="${FREQFLOW_FINAL_TEST_CHECKPOINT:-last}"
 RUN_FINAL_TEST="${FREQFLOW_RUN_FINAL_TEST:-1}"
 HORIZON_FREQUENCY_ROUTER="${FREQFLOW_HORIZON_FREQUENCY_ROUTER:-0}"
 FREQUENCY_ROUTER_MODE="${FREQFLOW_FREQUENCY_ROUTER_MODE:-time_lead_history}"
+FREQUENCY_ROUTER_LR="${FREQFLOW_FREQUENCY_ROUTER_LR:-}"
 INIT_CHECKPOINT="${FREQFLOW_INIT_CHECKPOINT:-}"
 INIT_CHECKPOINT_STATE="${FREQFLOW_INIT_CHECKPOINT_STATE:-ema}"
 
@@ -142,6 +143,9 @@ make_launch_command() {
     fi
     if [[ "${HORIZON_FREQUENCY_ROUTER}" == "1" ]]; then
         LAUNCH_CMD+=(--horizon-frequency-router --frequency-router-mode "${FREQUENCY_ROUTER_MODE}")
+        if [[ -n "${FREQUENCY_ROUTER_LR}" ]]; then
+            LAUNCH_CMD+=(--frequency-router-lr "${FREQUENCY_ROUTER_LR}")
+        fi
     fi
     if [[ -n "${INIT_CHECKPOINT}" ]]; then
         LAUNCH_CMD+=(--init-checkpoint "${INIT_CHECKPOINT}" --init-checkpoint-state "${INIT_CHECKPOINT_STATE}")
@@ -169,6 +173,7 @@ write_run_config() {
         echo "W&B: ${USE_WANDB} (project=${WANDB_PROJECT}, group=${WANDB_GROUP})"
         echo "Automatic full test: ${RUN_FINAL_TEST} (checkpoint=${FINAL_TEST_CHECKPOINT}.pt EMA)"
         echo "Horizon frequency router: ${HORIZON_FREQUENCY_ROUTER} (${FREQUENCY_ROUTER_MODE})"
+        echo "Frequency router learning rate: ${FREQUENCY_ROUTER_LR:-same as backbone}"
         echo "Initialization checkpoint: ${INIT_CHECKPOINT:-none} (${INIT_CHECKPOINT_STATE})"
         echo ""
         printf 'Command: '

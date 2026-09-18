@@ -81,30 +81,35 @@ class HorizonFrequencyRouter(nn.Module):
         )
         high_by_lead = high.reshape_as(low_by_lead)
 
-        # The router observes per-band RMS energy without using future truth.
-        low_energy = low_by_lead.float().square().mean(dim=(-2, -1)).sqrt()
-        high_energy = high_by_lead.float().square().mean(dim=(-2, -1)).sqrt()
-        energy = torch.stack((torch.log1p(low_energy), torch.log1p(high_energy)), dim=-1)
+        # Keep the small routing network in FP32 under BF16/FP16 autocast. Near
+        # 0.5, BF16 gates otherwise move in visible 0.00390625-wide steps.
+        with torch.autocast(device_type=low.device.type, enabled=False):
+            # The router observes per-band RMS energy without using future truth.
+            low_energy = low_by_lead.float().square().mean(dim=(-2, -1)).sqrt()
+            high_energy = high_by_lead.float().square().mean(dim=(-2, -1)).sqrt()
+            energy = torch.stack(
+                (torch.log1p(low_energy), torch.log1p(high_energy)), dim=-1
+            )
 
-        history_vector = history_features.float().mean(dim=(-2, -1))
-        time_vector = flow_time.float().reshape(batch_size, 1)
-        lead_indices = torch.arange(self.frames_out, device=low.device)
+            history_vector = history_features.float().mean(dim=(-2, -1))
+            time_vector = flow_time.float().reshape(batch_size, 1)
+            lead_indices = torch.arange(self.frames_out, device=low.device)
 
-        context = self.time_encoder(time_vector)[:, None, None, :]
-        if self.mode != "time":
-            context = context + self.lead_embedding(lead_indices)[None, :, None, :]
-        if self.mode in {"time_lead_history", "time_lead_history_energy"}:
-            context = context + self.history_encoder(history_vector)[:, None, None, :]
-        if self.mode == "time_lead_history_energy":
-            context = context + self.energy_encoder(energy)
+            context = self.time_encoder(time_vector)[:, None, None, :]
+            if self.mode != "time":
+                context = context + self.lead_embedding(lead_indices)[None, :, None, :]
+            if self.mode in {"time_lead_history", "time_lead_history_energy"}:
+                context = context + self.history_encoder(history_vector)[:, None, None, :]
+            if self.mode == "time_lead_history_energy":
+                context = context + self.energy_encoder(energy)
 
-        low_weight = torch.sigmoid(self.gate_head(context))
-        low_weight = low_weight.expand(
-            batch_size, self.frames_out, self.latent_channels, 1
-        ).unsqueeze(-1)
-        low_weight = low_weight.to(dtype=low.dtype)
+            low_weight_fp32 = torch.sigmoid(self.gate_head(context))
+            low_weight_fp32 = low_weight_fp32.expand(
+                batch_size, self.frames_out, self.latent_channels, 1
+            ).unsqueeze(-1)
+
+        low_weight = low_weight_fp32.to(dtype=low.dtype)
         high_weight = 1.0 - low_weight
-
         routed_low = (2.0 * low_weight * low_by_lead).reshape_as(low)
         routed_high = (2.0 * high_weight * high_by_lead).reshape_as(high)
-        return routed_low, routed_high, low_weight
+        return routed_low, routed_high, low_weight_fp32

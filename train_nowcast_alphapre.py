@@ -71,6 +71,12 @@ def parse_args():
         help="conditioning used by the horizon frequency router",
     )
     parser.add_argument(
+        "--frequency-router-lr",
+        type=float,
+        default=None,
+        help="router learning rate; defaults to --lr when omitted",
+    )
+    parser.add_argument(
         "--init-checkpoint",
         default=None,
         help="initialize model weights from a checkpoint without restoring optimizer/epoch state",
@@ -480,7 +486,27 @@ def main():
     ema_model = copy.deepcopy(model).eval().to(accelerator.device)
     for parameter in ema_model.parameters():
         parameter.requires_grad_(False)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    if args.horizon_frequency_router:
+        router_parameters = list(model.horizon_frequency_router.parameters())
+        router_parameter_ids = {id(parameter) for parameter in router_parameters}
+        backbone_parameters = [
+            parameter for parameter in model.parameters()
+            if id(parameter) not in router_parameter_ids
+        ]
+        router_lr = args.frequency_router_lr or args.lr
+        optimizer_parameters = [
+            {"params": backbone_parameters, "lr": args.lr},
+            {"params": router_parameters, "lr": router_lr},
+        ]
+    else:
+        router_lr = None
+        optimizer_parameters = model.parameters()
+    optimizer = torch.optim.AdamW(
+        optimizer_parameters,
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
+    )
     total_steps = max(1, args.epochs * len(train_loader))
     scheduler = cosine_schedule(optimizer, args.warmup_steps, total_steps)
     model, optimizer, scheduler, train_loader, valid_loader, test_loader = accelerator.prepare(
@@ -536,6 +562,8 @@ def main():
             f"{args.horizon_frequency_router} ({args.frequency_router_mode})",
             flush=True,
         )
+        if router_lr is not None:
+            print(f"Frequency Router LR: {router_lr:.3e}", flush=True)
         print(f"Train Batch Size (per process): {args.batch_size}", flush=True)
         print(f"Train Data: {len(train_loader)} batches per process", flush=True)
         print(f"Val Data: {len(valid_loader)} batches per process", flush=True)
