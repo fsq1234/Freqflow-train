@@ -32,6 +32,32 @@ accelerate launch --multi_gpu --num_processes 8 --main_process_port $port --mixe
             --cfg=$cfg --cfg_scale_pow=1.0 --guidance $guidance
 ```
 
+## Meteo latent-FreqFlow diagnostics
+
+After training, `analyze_nowcast_alphapre.py` compares the selected FreqFlow
+checkpoint with the frozen-VAE reconstruction upper bound on the complete
+Meteo test split.  The launcher writes per-lead categorical metrics, intensity
+bias, precipitation-centroid error, and radial spectral error without changing
+either checkpoint.
+
+Set the two checkpoint paths, run a two-batch smoke test, and then run the full
+diagnostic:
+
+```bash
+export FREQFLOW_VAE_CHECKPOINT=/path/to/vae/checkpoints/best_val_loss.pt
+export FREQFLOW_CHECKPOINT=/path/to/freqflow/checkpoints/best.pt
+
+bash analyze_meteonet_vae32.sh smoke
+bash analyze_meteonet_vae32.sh status
+
+bash analyze_meteonet_vae32.sh start
+bash analyze_meteonet_vae32.sh status
+```
+
+`FREQFLOW_LIMIT_BATCHES=0` means the complete test split, and
+`FREQFLOW_CHECKPOINT_STATE=ema` is the default because training validation and
+the automatic final test also use EMA weights.
+
 ## Reference
 If you have any question, feel free to contact [Sucheng Ren](oliverrensu@gmail.com)
 
