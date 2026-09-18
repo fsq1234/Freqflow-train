@@ -243,6 +243,9 @@ resume_training() {
     validate_setup
     resolve_resume_target "${1:-}"
     mkdir -p "${RUN_DIR}/checkpoints" "${RUN_DIR}/logs" "${RUNS_DIR}"
+    # A resumed run restores its own model, EMA, optimizer and scheduler.
+    # Do not also pass the baseline-only initialization checkpoint.
+    INIT_CHECKPOINT=""
     make_launch_command
     LAUNCH_CMD+=(--resume "${RESUME_CHECKPOINT}")
     printf '%s\n' "${RUN_DIR}" > "${LATEST_RUN_FILE}"
