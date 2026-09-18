@@ -40,6 +40,10 @@ VALID_LIMIT="${FREQFLOW_VALID_LIMIT:-0}"
 VLNUM="${FREQFLOW_VLNUM:-10}"
 FINAL_TEST_CHECKPOINT="${FREQFLOW_FINAL_TEST_CHECKPOINT:-last}"
 RUN_FINAL_TEST="${FREQFLOW_RUN_FINAL_TEST:-1}"
+HORIZON_FREQUENCY_ROUTER="${FREQFLOW_HORIZON_FREQUENCY_ROUTER:-0}"
+FREQUENCY_ROUTER_MODE="${FREQFLOW_FREQUENCY_ROUTER_MODE:-time_lead_history}"
+INIT_CHECKPOINT="${FREQFLOW_INIT_CHECKPOINT:-}"
+INIT_CHECKPOINT_STATE="${FREQFLOW_INIT_CHECKPOINT_STATE:-ema}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +72,9 @@ validate_setup() {
             [[ -f "${DATA_PATH}" ]] || die "MeteoNet latent HDF5 not found: ${DATA_PATH}"
             [[ -f "${RAW_DATA_PATH}" ]] || die "MeteoNet raw HDF5 not found: ${RAW_DATA_PATH}"
             [[ -f "${VAE_CHECKPOINT}" ]] || die "Meteo VAE checkpoint not found: ${VAE_CHECKPOINT}"
+            if [[ -n "${INIT_CHECKPOINT}" ]]; then
+                [[ -f "${INIT_CHECKPOINT}" ]] || die "initial checkpoint not found: ${INIT_CHECKPOINT}"
+            fi
             ;;
         *)
             die "unsupported dataset: ${DATASET}"
@@ -133,6 +140,12 @@ make_launch_command() {
     if [[ "${RUN_FINAL_TEST}" != "1" ]]; then
         LAUNCH_CMD+=(--skip-final-test)
     fi
+    if [[ "${HORIZON_FREQUENCY_ROUTER}" == "1" ]]; then
+        LAUNCH_CMD+=(--horizon-frequency-router --frequency-router-mode "${FREQUENCY_ROUTER_MODE}")
+    fi
+    if [[ -n "${INIT_CHECKPOINT}" ]]; then
+        LAUNCH_CMD+=(--init-checkpoint "${INIT_CHECKPOINT}" --init-checkpoint-state "${INIT_CHECKPOINT_STATE}")
+    fi
     return 0
 }
 
@@ -155,6 +168,8 @@ write_run_config() {
         echo "Progress log interval: ${LOG_EVERY} steps"
         echo "W&B: ${USE_WANDB} (project=${WANDB_PROJECT}, group=${WANDB_GROUP})"
         echo "Automatic full test: ${RUN_FINAL_TEST} (checkpoint=${FINAL_TEST_CHECKPOINT}.pt EMA)"
+        echo "Horizon frequency router: ${HORIZON_FREQUENCY_ROUTER} (${FREQUENCY_ROUTER_MODE})"
+        echo "Initialization checkpoint: ${INIT_CHECKPOINT:-none} (${INIT_CHECKPOINT_STATE})"
         echo ""
         printf 'Command: '
         printf '%q ' "${LAUNCH_CMD[@]}"

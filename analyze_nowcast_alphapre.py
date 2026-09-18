@@ -42,6 +42,12 @@ def parse_args():
     parser.add_argument("--vae-checkpoint", required=True)
     parser.add_argument("--checkpoint", required=True, help="trained FreqFlow best.pt or last.pt")
     parser.add_argument("--checkpoint-state", choices=("ema", "model"), default="ema")
+    parser.add_argument("--horizon-frequency-router", action="store_true")
+    parser.add_argument(
+        "--frequency-router-mode",
+        choices=("time", "time_lead", "time_lead_history", "time_lead_history_energy"),
+        default="time_lead_history",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--frames-in", type=int, default=5)
@@ -530,6 +536,8 @@ def main():
         args.img_size,
         dataset.latent_channels,
         dataset.latent_height,
+        horizon_frequency_router=args.horizon_frequency_router,
+        frequency_router_mode=args.frequency_router_mode,
     )
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if args.checkpoint_state not in checkpoint:

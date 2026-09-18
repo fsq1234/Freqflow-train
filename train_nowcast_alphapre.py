@@ -59,11 +59,36 @@ def parse_args():
     )
     parser.add_argument("--skip-final-test", action="store_true", help="skip only the automatic post-training full test")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--horizon-frequency-router",
+        action="store_true",
+        help="enable lead-time/history-conditioned latent frequency routing",
+    )
+    parser.add_argument(
+        "--frequency-router-mode",
+        choices=("time", "time_lead", "time_lead_history", "time_lead_history_energy"),
+        default="time_lead_history",
+        help="conditioning used by the horizon frequency router",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="initialize model weights from a checkpoint without restoring optimizer/epoch state",
+    )
+    parser.add_argument(
+        "--init-checkpoint-state",
+        choices=("model", "ema"),
+        default="ema",
+        help="checkpoint state used with --init-checkpoint",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def build_freqflow(frames_in, frames_out, img_size, latent_channels, latent_size):
+def build_freqflow(
+    frames_in, frames_out, img_size, latent_channels, latent_size,
+    horizon_frequency_router=False, frequency_router_mode="time_lead_history",
+):
     """Build the full-capacity original FreqFlow backbone for radar latents."""
     config = get_nowcast_config()
     actual = (img_size, frames_in, frames_out, latent_channels, latent_size)
@@ -81,6 +106,8 @@ def build_freqflow(frames_in, frames_out, img_size, latent_channels, latent_size
         raise ValueError("model output channels do not match frames_out * latent_channels")
     if model_args.history_channels != frames_in * latent_channels:
         raise ValueError("model history channels do not match frames_in * latent_channels")
+    model_args.horizon_frequency_router = horizon_frequency_router
+    model_args.horizon_frequency_router_mode = frequency_router_mode
     return utils.get_nnet(name=config.nnet.name, model_args=model_args)
 
 
@@ -200,6 +227,32 @@ def build_loaders(data_path, raw_data_path, img_size, frames_in, frames_out, bat
     return train_loader, valid_loader, test_loader, PIXEL_SCALE, THRESHOLDS, contract
 
 
+def reduce_frequency_gate(accelerator, model):
+    """Return the process-averaged low-frequency gate for each forecast lead."""
+    gate = getattr(accelerator.unwrap_model(model), "last_frequency_gate", None)
+    if gate is None:
+        return None
+    local_by_lead = gate.detach().float().mean(dim=(0, 2, 3, 4)).unsqueeze(0)
+    gathered = accelerator.gather(local_by_lead)
+    return gathered.mean(dim=0).cpu()
+
+
+def load_initial_model_state(module, checkpoint_state, router_enabled):
+    """Load a baseline state while allowing only newly added router parameters."""
+    incompatible = module.load_state_dict(checkpoint_state, strict=False)
+    allowed_prefix = "horizon_frequency_router."
+    bad_missing = [
+        key for key in incompatible.missing_keys
+        if not (router_enabled and key.startswith(allowed_prefix))
+    ]
+    if bad_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "incompatible initialization checkpoint: "
+            f"missing={bad_missing}, unexpected={incompatible.unexpected_keys}"
+        )
+    return incompatible.missing_keys
+
+
 def scale_corrected_target(value, output_height):
     """Match FreqFlow's existing target amplitude convention at a branch size."""
     full_height = value.shape[-2]
@@ -220,7 +273,7 @@ def conditional_freqflow_loss(model, history, future):
     flow_state = (1.0 - t_like) * noise + t_like * future
     velocity = future - noise
 
-    predictions = model(flow_state, log_snr=t * 8.0 - 4.0, history=history)
+    predictions = model(flow_state, t=t, log_snr=t * 8.0 - 4.0, history=history)
     frequency_prediction, spatial_prediction = predictions
     low, high = Fourier_filter(velocity, D=8)
     frequency_target = scale_corrected_target(
@@ -242,7 +295,7 @@ def sample_future(model, history, future_channels, sample_steps):
     dt = 1.0 / sample_steps
     for step in range(sample_steps):
         t = torch.full((state.shape[0],), step * dt, device=state.device, dtype=state.dtype)
-        velocity = model(state, log_snr=t * 8.0 - 4.0, history=history)[-1]
+        velocity = model(state, t=t, log_snr=t * 8.0 - 4.0, history=history)[-1]
         state = state + dt * velocity
     return state
 
@@ -382,6 +435,8 @@ def append_epoch_metrics(workdir, epoch, step, epoch_losses, lr, validation, bes
 
 def main():
     args = parse_args()
+    if args.resume and args.init_checkpoint:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.frames_in != 5 or args.frames_out != 20:
         raise ValueError("AlphaPre-compatible runs require --frames-in 5 --frames-out 20")
     if args.log_every < 1:
@@ -419,6 +474,8 @@ def main():
     wandb_run = init_wandb(args, workdir, run_config, accelerator)
     model = build_freqflow(
         args.frames_in, args.frames_out, args.img_size, latent_channels, latent_size,
+        horizon_frequency_router=args.horizon_frequency_router,
+        frequency_router_mode=args.frequency_router_mode,
     )
     ema_model = copy.deepcopy(model).eval().to(accelerator.device)
     for parameter in ema_model.parameters():
@@ -432,7 +489,30 @@ def main():
 
     start_epoch = step = 0
     best_csi = float("-inf")
-    if args.resume:
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        if args.init_checkpoint_state not in checkpoint:
+            raise KeyError(
+                f"checkpoint has no {args.init_checkpoint_state!r} state: {args.init_checkpoint}"
+            )
+        initial_state = checkpoint[args.init_checkpoint_state]
+        missing = load_initial_model_state(
+            accelerator.unwrap_model(model), initial_state, args.horizon_frequency_router
+        )
+        load_initial_model_state(ema_model, initial_state, args.horizon_frequency_router)
+        if accelerator.is_main_process:
+            print(
+                f"Initialized model and EMA from {args.init_checkpoint_state} state: "
+                f"{args.init_checkpoint}",
+                flush=True,
+            )
+            if missing:
+                print(
+                    f"Fresh horizon frequency router parameters: {len(missing)} tensors",
+                    flush=True,
+                )
+        del initial_state, checkpoint
+    elif args.resume:
         # These are self-produced, trusted training checkpoints containing
         # optimizer state and metadata.  PyTorch 2.6+ defaults to
         # ``weights_only=True``, which rejects the NumPy scalar stored by older
@@ -451,6 +531,11 @@ def main():
         print(f"Device: {accelerator.device}", flush=True)
         print(f"GPU Count: {torch.cuda.device_count()}", flush=True)
         print(f"Processes: {accelerator.num_processes}", flush=True)
+        print(
+            "Horizon Frequency Router: "
+            f"{args.horizon_frequency_router} ({args.frequency_router_mode})",
+            flush=True,
+        )
         print(f"Train Batch Size (per process): {args.batch_size}", flush=True)
         print(f"Train Data: {len(train_loader)} batches per process", flush=True)
         print(f"Val Data: {len(valid_loader)} batches per process", flush=True)
@@ -541,26 +626,39 @@ def main():
             should_log = batch_index == 1 or batch_index % args.log_every == 0 or batch_index == len(train_loader)
             if should_log:
                 logged_losses = reduce_losses(accelerator, losses)
+                gate_by_lead = reduce_frequency_gate(accelerator, model)
                 if accelerator.is_main_process:
+                    gate_message = ""
+                    if gate_by_lead is not None:
+                        gate_message = (
+                            f" low_gate={gate_by_lead.mean().item():.4f} "
+                            f"early={gate_by_lead[:5].mean().item():.4f} "
+                            f"late={gate_by_lead[-5:].mean().item():.4f}"
+                        )
                     print(
                         f"Epoch {epoch + 1}/{args.epochs}, Step {batch_index}/{len(train_loader)}, "
                         f"Global step {step} | total={logged_losses['total_loss']:.6f} "
                         f"spatial={logged_losses['spatial_loss']:.6f} "
-                        f"frequency={logged_losses['frequency_loss']:.6f} lr={lr:.3e}",
+                        f"frequency={logged_losses['frequency_loss']:.6f} lr={lr:.3e}"
+                        f"{gate_message}",
                         flush=True,
                     )
                     if wandb_run is not None:
-                        wandb_run.log(
-                            {
+                        wandb_metrics = {
                                 "Train/total_loss": logged_losses["total_loss"],
                                 "Train/spatial_loss": logged_losses["spatial_loss"],
                                 "Train/frequency_loss": logged_losses["frequency_loss"],
                                 "Learning_Rate": lr,
                                 "Epoch": epoch + 1,
                                 "Batch": batch_index,
-                            },
-                            step=step,
-                        )
+                        }
+                        if gate_by_lead is not None:
+                            wandb_metrics["FrequencyGate/low_mean"] = gate_by_lead.mean().item()
+                            wandb_metrics["FrequencyGate/low_early_1_5"] = gate_by_lead[:5].mean().item()
+                            wandb_metrics["FrequencyGate/low_late_16_20"] = gate_by_lead[-5:].mean().item()
+                            for lead_index, value in enumerate(gate_by_lead.tolist(), start=1):
+                                wandb_metrics[f"FrequencyGate/lead_{lead_index:02d}"] = value
+                        wandb_run.log(wandb_metrics, step=step)
         train_pbar.close()
         epoch_losses = mean_epoch_losses(accelerator, epoch_loss_sums, epoch_loss_count)
 

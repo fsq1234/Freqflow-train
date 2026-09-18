@@ -8,6 +8,7 @@ from timm.models.layers import trunc_normal_
 from .sigmoid.module import LayerNorm, RMSNorm, AdaRMSNorm, TDRMSNorm, QKNorm, TimeDependentParameter
 from .common_layers import Linear, EvenDownInterpolate, ChannelFirst, ChannelLast, Embedding
 from .axial_rope import AxialRoPE, make_axial_pos
+from .horizon_frequency import HorizonFrequencyRouter
 from fft2d import Fourier_filter
 # import DCNv4
 
@@ -322,6 +323,9 @@ class FreqFlow(nn.Module):
         # for conditional nowcasting, where channels is the number of future
         # frames and history_channels is the number of observed frames.
         self.history_channels = getattr(config, "history_channels", 0)
+        self.horizon_frequency_router_enabled = getattr(
+            config, "horizon_frequency_router", False
+        )
         if self.history_channels:
             # Encode the observed sequence once, then give each FreqFlow stage
             # its own view of it.  The 3x3 layers provide local motion/rain-band
@@ -340,6 +344,17 @@ class FreqFlow(nn.Module):
             self.spatial_condition = nn.Conv2d(
                 self.history_feature_dim, self.channels, kernel_size=1
             )
+        if self.horizon_frequency_router_enabled:
+            if not self.history_channels:
+                raise ValueError("horizon frequency routing requires history conditioning")
+            self.horizon_frequency_router = HorizonFrequencyRouter(
+                frames_out=config.frames_out,
+                latent_channels=config.latent_channels,
+                history_dim=self.history_feature_dim,
+                hidden_dim=getattr(config, "horizon_frequency_hidden_dim", 128),
+                mode=getattr(config, "horizon_frequency_router_mode", "time_lead_history"),
+            )
+        self.last_frequency_gate = None
 
         for stage_config in config.stage_configs:
             if hasattr(config, "condition_dim"):
@@ -362,7 +377,7 @@ class FreqFlow(nn.Module):
             for stage_config, lowres_dim, lowres_height in check_zip(config.stage_configs, lowres_dims, lowres_heights)]
         )
 
-    def _forward(self, images, log_snr, condition_classes = None, condition_text_embeds = None, condition_text_masks = None, condition_drop_prob = None, history = None):
+    def _forward(self, images, log_snr, condition_classes = None, condition_text_embeds = None, condition_text_masks = None, condition_drop_prob = None, history = None, flow_time = None):
         TimeDependentParameter.seed_time(self, log_snr)
 
         history_features = None
@@ -391,6 +406,11 @@ class FreqFlow(nn.Module):
         for idx, stage in enumerate(self.stages):
             if idx==0:
                 low_x, high_x = Fourier_filter(images, D=8)
+                if self.horizon_frequency_router_enabled:
+                    low_x, high_x, frequency_gate = self.horizon_frequency_router(
+                        low_x, high_x, history_features, flow_time
+                    )
+                    self.last_frequency_gate = frequency_gate.detach()
                 frequency_input = torch.cat([low_x, high_x], dim=1)
                 if self.history_channels:
                     frequency_input = frequency_input + self.frequency_condition(history_features)
@@ -409,5 +429,11 @@ class FreqFlow(nn.Module):
         return outputs
 
     def forward(self, x, t = None, log_snr = None, y = None, history = None):
-        return self._forward(images = x, log_snr = log_snr, condition_classes = y, history = history)
+        return self._forward(
+            images=x,
+            log_snr=log_snr,
+            condition_classes=y,
+            history=history,
+            flow_time=t,
+        )
         
