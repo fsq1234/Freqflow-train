@@ -12,6 +12,9 @@ export FREQFLOW_RAW_DATA_PATH="${FREQFLOW_RAW_DATA_PATH:-/mnt/sdb1/user/WRF/stlP
 export FREQFLOW_VAE_CHECKPOINT="${FREQFLOW_VAE_CHECKPOINT:-}"
 export FREQFLOW_CHECKPOINT="${FREQFLOW_CHECKPOINT:-}"
 export FREQFLOW_CHECKPOINT_STATE="${FREQFLOW_CHECKPOINT_STATE:-ema}"
+export FREQFLOW_HORIZON_FREQUENCY_ROUTER="${FREQFLOW_HORIZON_FREQUENCY_ROUTER:-0}"
+export FREQFLOW_FREQUENCY_ROUTER_MODE="${FREQFLOW_FREQUENCY_ROUTER_MODE:-time_lead_history}"
+export FREQFLOW_ROUTER_ONLY="${FREQFLOW_ROUTER_ONLY:-0}"
 export FREQFLOW_DIAGNOSTIC_GROUP="${FREQFLOW_DIAGNOSTIC_GROUP:-meteo-vae32-diagnostics}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export FREQFLOW_NUM_PROCESSES="${FREQFLOW_NUM_PROCESSES:-1}"
@@ -66,6 +69,15 @@ make_command() {
         --oracle-max-shift "${FREQFLOW_ORACLE_MAX_SHIFT}"
         --seed "${FREQFLOW_SEED}"
     )
+    if [[ "${FREQFLOW_HORIZON_FREQUENCY_ROUTER}" == "1" ]]; then
+        DIAGNOSTIC_COMMAND+=(
+            --horizon-frequency-router
+            --frequency-router-mode "${FREQFLOW_FREQUENCY_ROUTER_MODE}"
+        )
+    fi
+    if [[ "${FREQFLOW_ROUTER_ONLY}" == "1" ]]; then
+        DIAGNOSTIC_COMMAND+=(--router-only)
+    fi
 }
 
 start() {

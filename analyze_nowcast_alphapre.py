@@ -44,6 +44,11 @@ def parse_args():
     parser.add_argument("--checkpoint-state", choices=("ema", "model"), default="ema")
     parser.add_argument("--horizon-frequency-router", action="store_true")
     parser.add_argument(
+        "--router-only",
+        action="store_true",
+        help="run full latent sampling but only export frequency-router statistics",
+    )
+    parser.add_argument(
         "--frequency-router-mode",
         choices=("time", "time_lead", "time_lead_history", "time_lead_history_energy"),
         default="time_lead_history",
@@ -81,6 +86,61 @@ def _divide(numerator, denominator):
 
 def _as_list(value):
     return np.asarray(value, dtype=np.float64).tolist()
+
+
+class FrequencyRouterDiagnostics:
+    """Accumulate routing weights over samples, flow steps, leads and channels."""
+
+    def __init__(self, sample_steps, frames_out, latent_channels):
+        shape = (sample_steps, frames_out, latent_channels)
+        self.sample_steps = sample_steps
+        self.frames_out = frames_out
+        self.latent_channels = latent_channels
+        self.count = 0
+        self.weight_sum = np.zeros(shape, dtype=np.float64)
+        self.weight_squared_sum = np.zeros(shape, dtype=np.float64)
+
+    def update(self, low_weights):
+        values = np.asarray(low_weights, dtype=np.float64)
+        expected = (self.sample_steps, self.frames_out, self.latent_channels)
+        if values.ndim != 4 or values.shape[1:] != expected:
+            raise ValueError(
+                f"expected router weights [B,{expected[0]},{expected[1]},{expected[2]}], "
+                f"got {values.shape}"
+            )
+        self.count += values.shape[0]
+        self.weight_sum += values.sum(axis=0)
+        self.weight_squared_sum += np.square(values).sum(axis=0)
+
+    def finalize(self):
+        if self.count == 0:
+            raise RuntimeError("no frequency-router samples were accumulated")
+        mean = self.weight_sum / self.count
+        variance = np.maximum(self.weight_squared_sum / self.count - np.square(mean), 0.0)
+        std = np.sqrt(variance)
+        flow_times = np.arange(self.sample_steps, dtype=np.float64) / self.sample_steps
+        lead_mean = mean.mean(axis=(0, 2))
+        channel_mean = mean.mean(axis=(0, 1))
+        time_mean = mean.mean(axis=(1, 2))
+        overall_mean = float(mean.mean())
+        return {
+            "num_sequences": self.count,
+            "sample_steps": self.sample_steps,
+            "flow_times": _as_list(flow_times),
+            "low_weight_mean_by_time_lead_channel": _as_list(mean),
+            "low_weight_std_across_samples_by_time_lead_channel": _as_list(std),
+            "low_weight_mean_by_flow_time": _as_list(time_mean),
+            "low_weight_mean_by_lead": _as_list(lead_mean),
+            "low_weight_mean_by_latent_channel": _as_list(channel_mean),
+            "low_weight_overall_mean": overall_mean,
+            "low_weight_early_leads_1_5": float(lead_mean[:5].mean()),
+            "low_weight_middle_leads_6_15": float(lead_mean[5:15].mean()),
+            "low_weight_late_leads_16_20": float(lead_mean[-5:].mean()),
+            "low_multiplier_overall": 2.0 * overall_mean,
+            "high_multiplier_overall": 2.0 * (1.0 - overall_mean),
+            "maximum_cell_sample_std": float(std.max()),
+            "mean_cell_sample_std": float(std.mean()),
+        }
 
 
 class PixelDiagnostics:
@@ -483,6 +543,30 @@ def intensity_view(result):
     }
 
 
+@torch.no_grad()
+def sample_future_with_router_diagnostics(
+    model, history, future_channels, sample_steps, accelerator
+):
+    """Euler sample while retaining the gate produced at every flow step."""
+    state = torch.randn(
+        history.shape[0], future_channels, *history.shape[-2:],
+        device=history.device, dtype=history.dtype,
+    )
+    dt = 1.0 / sample_steps
+    gates = []
+    for step in range(sample_steps):
+        t = torch.full(
+            (state.shape[0],), step * dt, device=state.device, dtype=state.dtype
+        )
+        velocity = model(state, t=t, log_snr=t * 8.0 - 4.0, history=history)[-1]
+        gate = getattr(accelerator.unwrap_model(model), "last_frequency_gate", None)
+        if gate is None:
+            raise RuntimeError("frequency router did not expose a gate during sampling")
+        gates.append(gate[..., 0, 0].detach().float())
+        state = state + dt * velocity
+    return state, torch.stack(gates, dim=1)
+
+
 def main():
     args = parse_args()
     if args.frames_in != 5 or args.frames_out != 20:
@@ -491,6 +575,8 @@ def main():
         raise ValueError("batch sizes and sample steps must be positive")
     if args.limit_batches < 0:
         raise ValueError("--limit-batches must be zero or positive")
+    if args.router_only and not args.horizon_frequency_router:
+        raise ValueError("--router-only requires --horizon-frequency-router")
     if args.oracle_max_shift < 0 or args.oracle_max_shift >= args.img_size // 2:
         raise ValueError("--oracle-max-shift must be in [0, img_size/2)")
 
@@ -528,8 +614,10 @@ def main():
         "latent_std": dataset.latent_std,
     }
 
-    vae, _ = load_vae_checkpoint(args.vae_checkpoint, "cpu")
-    vae = vae.to(accelerator.device).eval().requires_grad_(False)
+    vae = None
+    if not args.router_only:
+        vae, _ = load_vae_checkpoint(args.vae_checkpoint, "cpu")
+        vae = vae.to(accelerator.device).eval().requires_grad_(False)
     model = build_freqflow(
         args.frames_in,
         args.frames_out,
@@ -553,6 +641,11 @@ def main():
     oracle_metrics = OracleDiagnostics(
         args.frames_out, THRESHOLDS, PIXEL_SCALE, args.oracle_max_shift
     )
+    router_metrics = None
+    if args.horizon_frequency_router:
+        router_metrics = FrequencyRouterDiagnostics(
+            args.sample_steps, args.frames_out, dataset.latent_channels
+        )
 
     total_batches = len(loader)
     if args.limit_batches:
@@ -579,12 +672,30 @@ def main():
                 accelerator.device,
             )
             with accelerator.autocast():
-                prediction = sample_future(
-                    model,
-                    history,
-                    args.frames_out * dataset.latent_channels,
-                    args.sample_steps,
-                )
+                if router_metrics is None:
+                    prediction = sample_future(
+                        model,
+                        history,
+                        args.frames_out * dataset.latent_channels,
+                        args.sample_steps,
+                    )
+                    router_weights = None
+                else:
+                    prediction, router_weights = sample_future_with_router_diagnostics(
+                        model,
+                        history,
+                        args.frames_out * dataset.latent_channels,
+                        args.sample_steps,
+                        accelerator,
+                    )
+            if args.router_only:
+                gathered_router_weights = accelerator.gather_for_metrics(
+                    router_weights
+                ).cpu()
+                if accelerator.is_main_process:
+                    router_metrics.update(gathered_router_weights.numpy())
+                processed_batches += 1
+                continue
             prediction_pixels = decode_future(
                 vae,
                 prediction,
@@ -609,16 +720,52 @@ def main():
             gathered_truth = accelerator.gather_for_metrics(truth).float().cpu()
             gathered_prediction = accelerator.gather_for_metrics(prediction_pixels).float().cpu()
             gathered_reconstruction = accelerator.gather_for_metrics(reconstruction_pixels).float().cpu()
+            gathered_router_weights = None
+            if router_weights is not None:
+                gathered_router_weights = accelerator.gather_for_metrics(router_weights).cpu()
             if accelerator.is_main_process:
                 forecast_metrics.update(gathered_prediction, gathered_truth)
                 vae_metrics.update(gathered_reconstruction, gathered_truth)
                 forecast_spectrum.update(gathered_prediction, gathered_truth)
                 vae_spectrum.update(gathered_reconstruction, gathered_truth)
                 oracle_metrics.update(gathered_prediction, gathered_truth)
+                if gathered_router_weights is not None:
+                    router_metrics.update(gathered_router_weights.numpy())
             processed_batches += 1
     progress.close()
 
     if accelerator.is_main_process:
+        if args.router_only:
+            router_result = router_metrics.finalize()
+            write_json(output_dir / "frequency_router_diagnostics.json", router_result)
+            write_json(
+                output_dir / "summary.json",
+                {
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "checkpoint_state": args.checkpoint_state,
+                    "latent_data": str(Path(args.data_path).resolve()),
+                    "sample_steps": args.sample_steps,
+                    "mixed_precision": args.mixed_precision,
+                    "seed": args.seed,
+                    "limit_batches": args.limit_batches,
+                    "processed_batches_per_process": processed_batches,
+                    "num_sequences": router_result["num_sequences"],
+                    "router_only": True,
+                    "output_files": ["frequency_router_diagnostics.json"],
+                },
+            )
+            print(f"Router diagnostics complete: {output_dir}", flush=True)
+            print(f"Evaluated sequences: {router_result['num_sequences']}", flush=True)
+            print(
+                "Frequency router: "
+                f"low_mean={router_result['low_weight_overall_mean']:.6f}; "
+                f"early={router_result['low_weight_early_leads_1_5']:.6f}; "
+                f"middle={router_result['low_weight_middle_leads_6_15']:.6f}; "
+                f"late={router_result['low_weight_late_leads_16_20']:.6f}; "
+                f"sample_std={router_result['mean_cell_sample_std']:.6f}",
+                flush=True,
+            )
+            return
         forecast_result = forecast_metrics.finalize()
         vae_result = vae_metrics.finalize()
         write_json(output_dir / "metrics_per_lead.json", forecast_result)
@@ -647,6 +794,20 @@ def main():
         )
         oracle_result = oracle_metrics.finalize()
         write_json(output_dir / "oracle_diagnostics.json", oracle_result)
+        router_result = None
+        if router_metrics is not None:
+            router_result = router_metrics.finalize()
+            write_json(output_dir / "frequency_router_diagnostics.json", router_result)
+        output_files = [
+            "metrics_per_lead.json",
+            "vae_upper_bound.json",
+            "intensity_bias.json",
+            "spatial_error.json",
+            "spectral_error.json",
+            "oracle_diagnostics.json",
+        ]
+        if router_result is not None:
+            output_files.append("frequency_router_diagnostics.json")
         write_json(
             output_dir / "summary.json",
             {
@@ -663,18 +824,21 @@ def main():
                 "num_sequences": forecast_result["num_sequences"],
                 "thresholds": list(THRESHOLDS),
                 "oracle_max_shift": args.oracle_max_shift,
-                "output_files": [
-                    "metrics_per_lead.json",
-                    "vae_upper_bound.json",
-                    "intensity_bias.json",
-                    "spatial_error.json",
-                    "spectral_error.json",
-                    "oracle_diagnostics.json",
-                ],
+                "output_files": output_files,
             },
         )
         print(f"Diagnostics complete: {output_dir}", flush=True)
         print(f"Evaluated sequences: {forecast_result['num_sequences']}", flush=True)
+        if router_result is not None:
+            print(
+                "Frequency router: "
+                f"low_mean={router_result['low_weight_overall_mean']:.6f}; "
+                f"early={router_result['low_weight_early_leads_1_5']:.6f}; "
+                f"middle={router_result['low_weight_middle_leads_6_15']:.6f}; "
+                f"late={router_result['low_weight_late_leads_16_20']:.6f}; "
+                f"sample_std={router_result['mean_cell_sample_std']:.6f}",
+                flush=True,
+            )
         for threshold in THRESHOLDS:
             forecast_csi = forecast_result["categorical"][str(threshold)]["mean_csi_over_leads"]
             vae_csi = vae_result["categorical"][str(threshold)]["mean_csi_over_leads"]
