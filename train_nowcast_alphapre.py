@@ -66,7 +66,10 @@ def parse_args():
     )
     parser.add_argument(
         "--frequency-router-mode",
-        choices=("time", "time_lead", "time_lead_history", "time_lead_history_energy"),
+        choices=(
+            "time", "time_lead", "time_lead_history", "time_lead_history_energy",
+            "state_adaptive_residual",
+        ),
         default="time_lead_history",
         help="conditioning used by the horizon frequency router",
     )
@@ -112,6 +115,7 @@ def build_freqflow(
         raise ValueError("model output channels do not match frames_out * latent_channels")
     if model_args.history_channels != frames_in * latent_channels:
         raise ValueError("model history channels do not match frames_in * latent_channels")
+    model_args.frames_in = frames_in
     model_args.horizon_frequency_router = horizon_frequency_router
     model_args.horizon_frequency_router_mode = frequency_router_mode
     return utils.get_nnet(name=config.nnet.name, model_args=model_args)
@@ -233,14 +237,23 @@ def build_loaders(data_path, raw_data_path, img_size, frames_in, frames_out, bat
     return train_loader, valid_loader, test_loader, PIXEL_SCALE, THRESHOLDS, contract
 
 
-def reduce_frequency_gate(accelerator, model):
-    """Return the process-averaged low-frequency gate for each forecast lead."""
-    gate = getattr(accelerator.unwrap_model(model), "last_frequency_gate", None)
-    if gate is None:
+def reduce_frequency_routing(accelerator, model):
+    """Return process-averaged low/high gains for each forecast lead."""
+    module = accelerator.unwrap_model(model)
+    low_gain = getattr(module, "last_frequency_low_gain", None)
+    high_gain = getattr(module, "last_frequency_high_gain", None)
+    if low_gain is None or high_gain is None:
         return None
-    local_by_lead = gate.detach().float().mean(dim=(0, 2, 3, 4)).unsqueeze(0)
-    gathered = accelerator.gather(local_by_lead)
-    return gathered.mean(dim=0).cpu()
+    gathered_low = accelerator.gather(low_gain.detach().float()[..., 0, 0]).cpu()
+    gathered_high = accelerator.gather(high_gain.detach().float()[..., 0, 0]).cpu()
+    return {
+        "low": gathered_low.mean(dim=(0, 2)),
+        "high": gathered_high.mean(dim=(0, 2)),
+        "low_by_channel": gathered_low.mean(dim=(0, 1)),
+        "high_by_channel": gathered_high.mean(dim=(0, 1)),
+        "low_sample_std": gathered_low.std(dim=0, unbiased=False).mean(),
+        "high_sample_std": gathered_high.std(dim=0, unbiased=False).mean(),
+    }
 
 
 def load_initial_model_state(module, checkpoint_state, router_enabled):
@@ -654,14 +667,18 @@ def main():
             should_log = batch_index == 1 or batch_index % args.log_every == 0 or batch_index == len(train_loader)
             if should_log:
                 logged_losses = reduce_losses(accelerator, losses)
-                gate_by_lead = reduce_frequency_gate(accelerator, model)
+                routing_by_lead = reduce_frequency_routing(accelerator, model)
                 if accelerator.is_main_process:
                     gate_message = ""
-                    if gate_by_lead is not None:
+                    if routing_by_lead is not None:
+                        low_by_lead = routing_by_lead["low"]
+                        high_by_lead = routing_by_lead["high"]
                         gate_message = (
-                            f" low_gate={gate_by_lead.mean().item():.4f} "
-                            f"early={gate_by_lead[:5].mean().item():.4f} "
-                            f"late={gate_by_lead[-5:].mean().item():.4f}"
+                            f" low_gain={low_by_lead.mean().item():.4f} "
+                            f"high_gain={high_by_lead.mean().item():.4f} "
+                            f"low_early={low_by_lead[:5].mean().item():.4f} "
+                            f"low_late={low_by_lead[-5:].mean().item():.4f} "
+                            f"sample_std={routing_by_lead['low_sample_std'].item():.5f}"
                         )
                     print(
                         f"Epoch {epoch + 1}/{args.epochs}, Step {batch_index}/{len(train_loader)}, "
@@ -680,12 +697,26 @@ def main():
                                 "Epoch": epoch + 1,
                                 "Batch": batch_index,
                         }
-                        if gate_by_lead is not None:
-                            wandb_metrics["FrequencyGate/low_mean"] = gate_by_lead.mean().item()
-                            wandb_metrics["FrequencyGate/low_early_1_5"] = gate_by_lead[:5].mean().item()
-                            wandb_metrics["FrequencyGate/low_late_16_20"] = gate_by_lead[-5:].mean().item()
-                            for lead_index, value in enumerate(gate_by_lead.tolist(), start=1):
-                                wandb_metrics[f"FrequencyGate/lead_{lead_index:02d}"] = value
+                        if routing_by_lead is not None:
+                            wandb_metrics["FrequencyGain/low_mean"] = low_by_lead.mean().item()
+                            wandb_metrics["FrequencyGain/high_mean"] = high_by_lead.mean().item()
+                            wandb_metrics["FrequencyGain/low_early_1_5"] = low_by_lead[:5].mean().item()
+                            wandb_metrics["FrequencyGain/low_late_16_20"] = low_by_lead[-5:].mean().item()
+                            wandb_metrics["FrequencyGain/low_sample_std"] = routing_by_lead["low_sample_std"].item()
+                            wandb_metrics["FrequencyGain/high_sample_std"] = routing_by_lead["high_sample_std"].item()
+                            for channel_index, (low_value, high_value) in enumerate(
+                                zip(
+                                    routing_by_lead["low_by_channel"].tolist(),
+                                    routing_by_lead["high_by_channel"].tolist(),
+                                )
+                            ):
+                                wandb_metrics[f"FrequencyGain/low_channel_{channel_index}"] = low_value
+                                wandb_metrics[f"FrequencyGain/high_channel_{channel_index}"] = high_value
+                            for lead_index, (low_value, high_value) in enumerate(
+                                zip(low_by_lead.tolist(), high_by_lead.tolist()), start=1
+                            ):
+                                wandb_metrics[f"FrequencyGain/low_lead_{lead_index:02d}"] = low_value
+                                wandb_metrics[f"FrequencyGain/high_lead_{lead_index:02d}"] = high_value
                         wandb_run.log(wandb_metrics, step=step)
         train_pbar.close()
         epoch_losses = mean_epoch_losses(accelerator, epoch_loss_sums, epoch_loss_count)

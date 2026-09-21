@@ -351,10 +351,13 @@ class FreqFlow(nn.Module):
                 frames_out=config.frames_out,
                 latent_channels=config.latent_channels,
                 history_dim=self.history_feature_dim,
+                frames_in=config.frames_in,
                 hidden_dim=getattr(config, "horizon_frequency_hidden_dim", 128),
                 mode=getattr(config, "horizon_frequency_router_mode", "time_lead_history"),
             )
         self.last_frequency_gate = None
+        self.last_frequency_low_gain = None
+        self.last_frequency_high_gain = None
 
         for stage_config in config.stage_configs:
             if hasattr(config, "condition_dim"):
@@ -407,10 +410,18 @@ class FreqFlow(nn.Module):
             if idx==0:
                 low_x, high_x = Fourier_filter(images, D=8)
                 if self.horizon_frequency_router_enabled:
-                    low_x, high_x, frequency_gate = self.horizon_frequency_router(
-                        low_x, high_x, history_features, flow_time
+                    history_low = history_high = None
+                    if self.horizon_frequency_router.mode == "state_adaptive_residual":
+                        history_low, history_high = Fourier_filter(history, D=8)
+                    low_x, high_x, low_gain, high_gain = self.horizon_frequency_router(
+                        low_x, high_x, history_features, flow_time,
+                        history_low=history_low, history_high=history_high,
                     )
-                    self.last_frequency_gate = frequency_gate.detach()
+                    self.last_frequency_low_gain = low_gain.detach()
+                    self.last_frequency_high_gain = high_gain.detach()
+                    # Compatibility for tools written for the complementary
+                    # v1 gate. New code should inspect both independent gains.
+                    self.last_frequency_gate = (low_gain / 2.0).detach()
                 frequency_input = torch.cat([low_x, high_x], dim=1)
                 if self.history_channels:
                     frequency_input = frequency_input + self.frequency_condition(history_features)

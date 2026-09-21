@@ -50,7 +50,10 @@ def parse_args():
     )
     parser.add_argument(
         "--frequency-router-mode",
-        choices=("time", "time_lead", "time_lead_history", "time_lead_history_energy"),
+        choices=(
+            "time", "time_lead", "time_lead_history", "time_lead_history_energy",
+            "state_adaptive_residual",
+        ),
         default="time_lead_history",
     )
     parser.add_argument("--output-dir", required=True)
@@ -89,57 +92,57 @@ def _as_list(value):
 
 
 class FrequencyRouterDiagnostics:
-    """Accumulate routing weights over samples, flow steps, leads and channels."""
+    """Accumulate low/high gains over samples, flow steps, leads and channels."""
 
     def __init__(self, sample_steps, frames_out, latent_channels):
-        shape = (sample_steps, frames_out, latent_channels)
+        shape = (sample_steps, frames_out, latent_channels, 2)
         self.sample_steps = sample_steps
         self.frames_out = frames_out
         self.latent_channels = latent_channels
         self.count = 0
-        self.weight_sum = np.zeros(shape, dtype=np.float64)
-        self.weight_squared_sum = np.zeros(shape, dtype=np.float64)
+        self.gain_sum = np.zeros(shape, dtype=np.float64)
+        self.gain_squared_sum = np.zeros(shape, dtype=np.float64)
 
-    def update(self, low_weights):
-        values = np.asarray(low_weights, dtype=np.float64)
-        expected = (self.sample_steps, self.frames_out, self.latent_channels)
-        if values.ndim != 4 or values.shape[1:] != expected:
+    def update(self, gains):
+        values = np.asarray(gains, dtype=np.float64)
+        expected = (self.sample_steps, self.frames_out, self.latent_channels, 2)
+        if values.ndim != 5 or values.shape[1:] != expected:
             raise ValueError(
-                f"expected router weights [B,{expected[0]},{expected[1]},{expected[2]}], "
+                "expected router gains "
+                f"[B,{expected[0]},{expected[1]},{expected[2]},2], "
                 f"got {values.shape}"
             )
         self.count += values.shape[0]
-        self.weight_sum += values.sum(axis=0)
-        self.weight_squared_sum += np.square(values).sum(axis=0)
+        self.gain_sum += values.sum(axis=0)
+        self.gain_squared_sum += np.square(values).sum(axis=0)
 
     def finalize(self):
         if self.count == 0:
             raise RuntimeError("no frequency-router samples were accumulated")
-        mean = self.weight_sum / self.count
-        variance = np.maximum(self.weight_squared_sum / self.count - np.square(mean), 0.0)
+        mean = self.gain_sum / self.count
+        variance = np.maximum(self.gain_squared_sum / self.count - np.square(mean), 0.0)
         std = np.sqrt(variance)
         flow_times = np.arange(self.sample_steps, dtype=np.float64) / self.sample_steps
         lead_mean = mean.mean(axis=(0, 2))
         channel_mean = mean.mean(axis=(0, 1))
         time_mean = mean.mean(axis=(1, 2))
-        overall_mean = float(mean.mean())
+        overall_mean = mean.mean(axis=(0, 1, 2))
         return {
             "num_sequences": self.count,
             "sample_steps": self.sample_steps,
             "flow_times": _as_list(flow_times),
-            "low_weight_mean_by_time_lead_channel": _as_list(mean),
-            "low_weight_std_across_samples_by_time_lead_channel": _as_list(std),
-            "low_weight_mean_by_flow_time": _as_list(time_mean),
-            "low_weight_mean_by_lead": _as_list(lead_mean),
-            "low_weight_mean_by_latent_channel": _as_list(channel_mean),
-            "low_weight_overall_mean": overall_mean,
-            "low_weight_early_leads_1_5": float(lead_mean[:5].mean()),
-            "low_weight_middle_leads_6_15": float(lead_mean[5:15].mean()),
-            "low_weight_late_leads_16_20": float(lead_mean[-5:].mean()),
-            "low_multiplier_overall": 2.0 * overall_mean,
-            "high_multiplier_overall": 2.0 * (1.0 - overall_mean),
-            "maximum_cell_sample_std": float(std.max()),
-            "mean_cell_sample_std": float(std.mean()),
+            "band_order": ["low", "high"],
+            "gain_mean_by_time_lead_channel_band": _as_list(mean),
+            "gain_std_across_samples_by_time_lead_channel_band": _as_list(std),
+            "gain_mean_by_flow_time": _as_list(time_mean),
+            "gain_mean_by_lead": _as_list(lead_mean),
+            "gain_mean_by_latent_channel": _as_list(channel_mean),
+            "gain_overall_mean": _as_list(overall_mean),
+            "gain_early_leads_1_5": _as_list(lead_mean[:5].mean(axis=0)),
+            "gain_middle_leads_6_15": _as_list(lead_mean[5:15].mean(axis=0)),
+            "gain_late_leads_16_20": _as_list(lead_mean[-5:].mean(axis=0)),
+            "maximum_cell_sample_std": _as_list(std.max(axis=(0, 1, 2))),
+            "mean_cell_sample_std": _as_list(std.mean(axis=(0, 1, 2))),
         }
 
 
@@ -553,18 +556,24 @@ def sample_future_with_router_diagnostics(
         device=history.device, dtype=history.dtype,
     )
     dt = 1.0 / sample_steps
-    gates = []
+    routing_gains = []
     for step in range(sample_steps):
         t = torch.full(
             (state.shape[0],), step * dt, device=state.device, dtype=state.dtype
         )
         velocity = model(state, t=t, log_snr=t * 8.0 - 4.0, history=history)[-1]
-        gate = getattr(accelerator.unwrap_model(model), "last_frequency_gate", None)
-        if gate is None:
-            raise RuntimeError("frequency router did not expose a gate during sampling")
-        gates.append(gate[..., 0, 0].detach().float())
+        module = accelerator.unwrap_model(model)
+        low_gain = getattr(module, "last_frequency_low_gain", None)
+        high_gain = getattr(module, "last_frequency_high_gain", None)
+        if low_gain is None or high_gain is None:
+            raise RuntimeError("frequency router did not expose gains during sampling")
+        routing_gains.append(
+            torch.stack(
+                (low_gain[..., 0, 0], high_gain[..., 0, 0]), dim=-1
+            ).detach().float()
+        )
         state = state + dt * velocity
-    return state, torch.stack(gates, dim=1)
+    return state, torch.stack(routing_gains, dim=1)
 
 
 def main():
@@ -758,11 +767,12 @@ def main():
             print(f"Evaluated sequences: {router_result['num_sequences']}", flush=True)
             print(
                 "Frequency router: "
-                f"low_mean={router_result['low_weight_overall_mean']:.6f}; "
-                f"early={router_result['low_weight_early_leads_1_5']:.6f}; "
-                f"middle={router_result['low_weight_middle_leads_6_15']:.6f}; "
-                f"late={router_result['low_weight_late_leads_16_20']:.6f}; "
-                f"sample_std={router_result['mean_cell_sample_std']:.6f}",
+                f"low_gain={router_result['gain_overall_mean'][0]:.6f}; "
+                f"high_gain={router_result['gain_overall_mean'][1]:.6f}; "
+                f"low_early={router_result['gain_early_leads_1_5'][0]:.6f}; "
+                f"low_late={router_result['gain_late_leads_16_20'][0]:.6f}; "
+                f"sample_std_low={router_result['mean_cell_sample_std'][0]:.6f}; "
+                f"sample_std_high={router_result['mean_cell_sample_std'][1]:.6f}",
                 flush=True,
             )
             return
@@ -832,11 +842,12 @@ def main():
         if router_result is not None:
             print(
                 "Frequency router: "
-                f"low_mean={router_result['low_weight_overall_mean']:.6f}; "
-                f"early={router_result['low_weight_early_leads_1_5']:.6f}; "
-                f"middle={router_result['low_weight_middle_leads_6_15']:.6f}; "
-                f"late={router_result['low_weight_late_leads_16_20']:.6f}; "
-                f"sample_std={router_result['mean_cell_sample_std']:.6f}",
+                f"low_gain={router_result['gain_overall_mean'][0]:.6f}; "
+                f"high_gain={router_result['gain_overall_mean'][1]:.6f}; "
+                f"low_early={router_result['gain_early_leads_1_5'][0]:.6f}; "
+                f"low_late={router_result['gain_late_leads_16_20'][0]:.6f}; "
+                f"sample_std_low={router_result['mean_cell_sample_std'][0]:.6f}; "
+                f"sample_std_high={router_result['mean_cell_sample_std'][1]:.6f}",
                 flush=True,
             )
         for threshold in THRESHOLDS:
