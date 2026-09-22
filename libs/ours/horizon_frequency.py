@@ -8,9 +8,10 @@ class HorizonFrequencyRouter(nn.Module):
     """Condition frequency routing on flow time, horizon and precipitation state.
 
     Legacy modes use one complementary low-frequency gate.  The
-    ``state_adaptive_residual`` mode predicts independent bounded residual
-    gains for the low- and high-frequency bands.  Both parameterizations are
-    exact identity transformations at initialization.
+    ``state_adaptive_residual`` predicts independent bounded residual gains.
+    ``state_adaptive_contrast`` removes their common-scale degree of freedom:
+    it predicts one bounded contrast and enforces ``low_gain + high_gain = 2``.
+    Every parameterization is an exact identity transformation initially.
     """
 
     def __init__(
@@ -36,17 +37,21 @@ class HorizonFrequencyRouter(nn.Module):
             "time_lead_history",
             "time_lead_history_energy",
             "state_adaptive_residual",
+            "state_adaptive_contrast",
         }
         if mode not in valid_modes:
             raise ValueError(f"unsupported horizon frequency router mode: {mode}")
         self.mode = mode
+        self.state_adaptive = mode in {
+            "state_adaptive_residual", "state_adaptive_contrast"
+        }
 
         self.time_encoder = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        if self.mode == "state_adaptive_residual":
+        if self.state_adaptive:
             self.lead_encoder = nn.Sequential(
                 nn.Linear(1, hidden_dim),
                 nn.SiLU(),
@@ -61,7 +66,7 @@ class HorizonFrequencyRouter(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        if self.mode == "state_adaptive_residual":
+        if self.state_adaptive:
             self.channel_embedding = nn.Embedding(latent_channels, hidden_dim)
             self.state_energy_encoder = nn.Sequential(
                 nn.Linear(2, hidden_dim),
@@ -77,7 +82,10 @@ class HorizonFrequencyRouter(nn.Module):
             )
             self.gain_head = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(hidden_dim, 2),
+                nn.Linear(
+                    hidden_dim,
+                    1 if self.mode == "state_adaptive_contrast" else 2,
+                ),
             )
             nn.init.zeros_(self.gain_head[-1].weight)
             nn.init.zeros_(self.gain_head[-1].bias)
@@ -137,7 +145,7 @@ class HorizonFrequencyRouter(nn.Module):
 
             context = self.time_encoder(time_vector)[:, None, None, :]
             if self.mode != "time":
-                if self.mode == "state_adaptive_residual":
+                if self.state_adaptive:
                     normalized_lead = (
                         (lead_indices.float() + 1.0) / self.frames_out
                     ).unsqueeze(-1)
@@ -147,11 +155,11 @@ class HorizonFrequencyRouter(nn.Module):
                 context = context + lead_context[None, :, None, :]
             if self.mode in {
                 "time_lead_history", "time_lead_history_energy",
-                "state_adaptive_residual",
+                "state_adaptive_residual", "state_adaptive_contrast",
             }:
                 context = context + self.history_encoder(history_vector)[:, None, None, :]
 
-            if self.mode == "state_adaptive_residual":
+            if self.state_adaptive:
                 if history_low is None or history_high is None:
                     raise ValueError(
                         "state-adaptive routing requires low/high historical bands"
@@ -186,11 +194,22 @@ class HorizonFrequencyRouter(nn.Module):
                     historical_descriptor
                 )[:, None, :, :]
 
-                # Each band receives an independent residual multiplier in
-                # [0.5, 1.5]. Zero logits give gain=1 exactly.
-                residual = 0.5 * torch.tanh(self.gain_head(context))
-                low_gain_fp32 = (1.0 + residual[..., 0]).unsqueeze(-1).unsqueeze(-1)
-                high_gain_fp32 = (1.0 + residual[..., 1]).unsqueeze(-1).unsqueeze(-1)
+                if self.mode == "state_adaptive_contrast":
+                    # A single state-dependent contrast prevents the common
+                    # attenuation shortcut observed in the independent-gain
+                    # experiment. Gains remain in [0.75, 1.25] and sum to 2.
+                    contrast = 0.25 * torch.tanh(self.gain_head(context)[..., 0])
+                    low_gain_fp32 = (1.0 + contrast).unsqueeze(-1).unsqueeze(-1)
+                    high_gain_fp32 = (1.0 - contrast).unsqueeze(-1).unsqueeze(-1)
+                else:
+                    # Independent residual multipliers in [0.5, 1.5].
+                    residual = 0.5 * torch.tanh(self.gain_head(context))
+                    low_gain_fp32 = (
+                        1.0 + residual[..., 0]
+                    ).unsqueeze(-1).unsqueeze(-1)
+                    high_gain_fp32 = (
+                        1.0 + residual[..., 1]
+                    ).unsqueeze(-1).unsqueeze(-1)
             else:
                 if self.mode == "time_lead_history_energy":
                     context = context + self.energy_encoder(energy)

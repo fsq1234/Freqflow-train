@@ -411,7 +411,7 @@ class FreqFlow(nn.Module):
                 low_x, high_x = Fourier_filter(images, D=8)
                 if self.horizon_frequency_router_enabled:
                     history_low = history_high = None
-                    if self.horizon_frequency_router.mode == "state_adaptive_residual":
+                    if self.horizon_frequency_router.state_adaptive:
                         history_low, history_high = Fourier_filter(history, D=8)
                     low_x, high_x, low_gain, high_gain = self.horizon_frequency_router(
                         low_x, high_x, history_features, flow_time,

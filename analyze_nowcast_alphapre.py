@@ -52,7 +52,7 @@ def parse_args():
         "--frequency-router-mode",
         choices=(
             "time", "time_lead", "time_lead_history", "time_lead_history_energy",
-            "state_adaptive_residual",
+            "state_adaptive_residual", "state_adaptive_contrast",
         ),
         default="time_lead_history",
     )
